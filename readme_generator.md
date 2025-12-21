@@ -7,28 +7,29 @@
 ## Архитектура
 
 ```
-Question → Classifier → Retriever → Chunks → AnswerGenerator → GenerationResult
-                                    ↓
-                              AnswerPolicy Selection
-                                    ↓
-                              Context Building (with limits)
-                                    ↓
-                              Prompt Template Selection
-                                    ↓
-                              LLM Generation (or direct citation)
-                                    ↓
-                              Citation Validation
-                                    ↓
-                              GenerationResult
+Question → Classifier → Post-Classification Override → Retriever → Chunks → AnswerGenerator → GenerationResult
+                                    ↓                                           ↓
+                            Regulatory Principle Detection          AnswerPolicy Selection
+                                    ↓                                           ↓
+                            Category Override                         Context Building (with limits)
+                                                                              ↓
+                                                                      Prompt Template Selection
+                                                                              ↓
+                                                                      LLM Generation (or direct citation)
+                                                                              ↓
+                                                                      Citation Validation (strict anchor check)
+                                                                              ↓
+                                                                      GenerationResult
 ```
 
 ### Основные компоненты
 
-1. **AnswerPolicy** - определяет стратегию генерации ответа
-2. **Context Builder** - нормализует и ограничивает контекст по политике
-3. **Prompt Templates** - специализированные промпты для каждой политики
-4. **LLM Client** - обертка над OpenAI-compatible API (VseGPT)
-5. **Citation Validator** - валидирует и фильтрует citations из LLM ответов
+1. **Post-Classification Override** - применяет доменные правила после классификации (например, `regulatory_principle` для концепций типа "minimum necessary")
+2. **AnswerPolicy** - определяет стратегию генерации ответа
+3. **Context Builder** - нормализует и ограничивает контекст по политике
+4. **Prompt Templates** - специализированные промпты для каждой политики (с поддержкой `regulatory_principle`)
+5. **LLM Client** - обертка над OpenAI-compatible API (VseGPT)
+6. **Citation Validator** - валидирует и фильтрует citations из LLM ответов (строгая валидация anchors)
 
 ## Маппинг: Category → Retriever → Policy → Output Format
 
@@ -37,6 +38,7 @@ Question → Classifier → Retriever → Chunks → AnswerGenerator → Generat
 | `citation-required` | `CitationRetriever` | `STRICT_CITATION` | Bullet points: `anchor - text_raw` | 10 | ❌ No (direct) |
 | `overview / purpose` | `OverviewPurposeRetriever` | `SUMMARY` | 2-4 sentences, 1 anchor reference | 2 | ✅ Yes |
 | `definition` | `DefinitionRetriever` | `QUOTED_ANSWER` | 1-2 sentences + 1-3 exact quotes with anchors (JSON) | 6 | ✅ Yes |
+| `regulatory_principle` | `ProceduralRetriever` | `QUOTED_ANSWER` | Special format: "HIPAA does not provide..." + 1-3 exact quotes with anchors (JSON) | 6 | ✅ Yes |
 | `procedural / best practices` | `ProceduralRetriever` | `QUOTED_ANSWER` | Yes/No/Unclear + 1-3 exact quotes with anchors (JSON) | 6 | ✅ Yes |
 | `scope / applicability` | `ScopeRetriever` | `LISTING` | Structured list, each item with anchor (JSON) | 10 | ✅ Yes |
 | `penalties` | `PenaltiesRetriever` | `LISTING` | Structured list, each item with anchor (JSON) | 10 | ✅ Yes |
@@ -177,13 +179,18 @@ class Citation:
 ### QUOTED_ANSWER
 
 **Когда используется:**
-- Категории: `definition`, `procedural / best practices`, `other`
-- Для `definition` и `procedural`: citations обязательны
+- Категории: `definition`, `regulatory_principle`, `procedural / best practices`, `other`
+- Для `definition`, `regulatory_principle` и `procedural`: citations обязательны
 
 **Особенности:**
 - LLM возвращает JSON: `{"answer": "...", "citations": [...]}`
 - Citations валидируются (anchor должен быть в context, quote должен быть подстрокой text_raw)
 - Для `definition`: если нет валидных citations → "Insufficient context to provide exact citation."
+- Для `regulatory_principle`: специальный формат ответа:
+  - Начинается с: "HIPAA does not provide a standalone definition of 'X' in the Definitions section."
+  - Объясняет нормативный смысл как требование/принцип (не словарное определение)
+  - Обязательны 1-3 цитаты с anchors
+  - Запрет на придумывание определений вида "X means..."
 - Для `procedural`: может включать yesno_signal от ретривера
 - Лимит контекста: 6 элементов
 
@@ -204,15 +211,15 @@ class Citation:
 ### Процесс валидации
 
 1. **Парсинг JSON** из LLM ответа (поддержка markdown code fences)
-2. **Проверка anchor**: anchor должен существовать в `context_items`
+2. **СТРОГАЯ проверка anchor**: anchor должен точно совпадать с anchor в `context_items` (без поблажек, придуманные anchors отклоняются)
 3. **Проверка quote**: quote должен быть подстрокой `text_raw` соответствующего context item (после нормализации whitespace)
 4. **Автоисправление quote** (если `auto_fix_quote=True`, по умолчанию включено):
    - Если anchor валиден, но quote отсутствует или невалиден → автоматически извлекается релевантный фрагмент из `text_raw`
    - Приоритет извлечения:
      1. Первое предложение (до точки/восклицательного/вопросительного знака)
      2. Первые 300 символов (обрезается по слову)
-5. **Фильтрация**: citations с невалидными anchors удаляются
-6. **Обязательность**: для `definition` и `procedural` - если после автоисправления нет валидных citations → "Insufficient context to provide exact citation."
+5. **Фильтрация**: citations с невалидными anchors удаляются (anchor не может быть исправлен автоматически)
+6. **Обязательность**: для `definition`, `regulatory_principle` и `procedural` - если после автоисправления нет валидных citations → "Insufficient context to provide exact citation."
 
 ### Правила валидации
 
@@ -226,9 +233,10 @@ def validate_citation(
     if not anchor:
         return None
     
-    # 2. Поиск context_item с таким anchor
-    matching_item = find_by_anchor(anchor, context_items)
+    # 2. СТРОГИЙ поиск context_item с таким anchor (точное совпадение)
+    matching_item = find_by_anchor(anchor, context_items)  # Строгое сравнение: anchor.strip() == item.anchor.strip()
     if not matching_item:
+        # Anchor не найден - citation отклоняется (anchor не может быть исправлен)
         return None
     
     # 3. Если quote отсутствует и auto_fix_quote=True - извлекаем релевантный фрагмент

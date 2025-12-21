@@ -130,7 +130,7 @@ def calculate_keyword_score_procedural(text: str, topic_tokens: List[str]) -> fl
     
     Args:
         text: Текст для анализа
-        topic_tokens: Список токенов темы (например, encryption tokens)
+        topic_tokens: Список токенов темы (например, encryption tokens, minimum necessary tokens)
     
     Returns:
         keyword_score в диапазоне 0..1
@@ -142,6 +142,12 @@ def calculate_keyword_score_procedural(text: str, topic_tokens: List[str]) -> fl
     encryption_tokens = ["encrypt", "encryption", "decrypt", "cryptograph"]
     if any(token in text_lower for token in encryption_tokens):
         if any(token in topic_tokens for token in encryption_tokens):
+            score += 1.0
+    
+    # Проверка на minimum necessary токены (для regulatory_principle)
+    minimum_necessary_tokens = ["minimum necessary", "reasonable efforts", "limit", "accomplish the intended purpose"]
+    if any(token in text_lower for token in minimum_necessary_tokens):
+        if any(token in topic_tokens for token in minimum_necessary_tokens):
             score += 1.0
     
     # Проверка на implementation specification или addressable

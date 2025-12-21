@@ -51,6 +51,7 @@ def test_policy_selection_by_category():
         ("citation-required", AnswerPolicy.STRICT_CITATION),
         ("overview / purpose", AnswerPolicy.SUMMARY),
         ("definition", AnswerPolicy.QUOTED_ANSWER),
+        ("regulatory_principle", AnswerPolicy.QUOTED_ANSWER),
         ("procedural / best practices", AnswerPolicy.QUOTED_ANSWER),
         ("scope / applicability", AnswerPolicy.LISTING),
         ("penalties", AnswerPolicy.LISTING),

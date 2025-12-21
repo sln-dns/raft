@@ -25,6 +25,20 @@ class ProceduralRetriever(BaseRetriever):
     TOPIC_TOKENS = {
         "encryption": ["encrypt", "encryption", "decrypt", "cryptograph", "key management"],
         "security": ["security", "safeguard", "safeguards", "technical safeguard", "administrative safeguard", "physical safeguard"],
+        "minimum_necessary": [
+            "minimum necessary",
+            "minimum necessary standard",
+            "reasonable efforts",
+            "limit",
+            "accomplish the intended purpose",
+            "minimum amount",
+            "reasonably necessary",
+        ],
+    }
+    
+    # Soft boost anchors для regulatory principles (например, minimum necessary)
+    REGULATORY_PRINCIPLE_BOOST_ANCHORS = {
+        "minimum_necessary": ["§164.502", "§164.514"],  # §164.502(b), §164.514(d) и связанные
     }
     
     # Общие токены для требований/рекомендаций
@@ -60,6 +74,7 @@ class ProceduralRetriever(BaseRetriever):
         seed_k: int = 3,
         expand_section: bool = True,
         need_yesno: bool = True,
+        category: Optional[str] = None,
         **kwargs
     ) -> List[Dict[str, Any]]:
         """
@@ -84,10 +99,10 @@ class ProceduralRetriever(BaseRetriever):
         parts = parts or [164]  # По умолчанию Part 164 (security/privacy)
         k = min(k, max_results, 6)  # Максимум 6 пунктов
         
-        logger.info(f"ProceduralRetriever (from new module): question='{question[:50]}...', k={k}, seed_k={seed_k}, expand={expand_section}, need_yesno={need_yesno}")
+        logger.info(f"ProceduralRetriever (from new module): question='{question[:50]}...', k={k}, seed_k={seed_k}, expand={expand_section}, need_yesno={need_yesno}, category={category}")
         
         # Step 0: Определить под-тему и ключевые токены
-        topic, topic_tokens = self._extract_topic_and_tokens(question)
+        topic, topic_tokens = self._extract_topic_and_tokens(question, category)
         logger.info(f"Извлеченная тема: {topic}, токены: {topic_tokens[:5]}...")
         
         # Step 1: Подготовка FTS query (усиление)
@@ -122,10 +137,29 @@ class ProceduralRetriever(BaseRetriever):
         for candidate in candidates:
             candidate.keyword_score = calculate_keyword_score_procedural(candidate.text_raw, topic_tokens)
         
+        # Step 3.5: Soft boost для regulatory principles (если категория regulatory_principle)
+        if category == "regulatory_principle" and topic in self.REGULATORY_PRINCIPLE_BOOST_ANCHORS:
+            boost_anchors = self.REGULATORY_PRINCIPLE_BOOST_ANCHORS[topic]
+            for candidate in candidates:
+                if candidate.anchor:
+                    # Проверяем, начинается ли anchor с boost anchor prefix
+                    for boost_anchor in boost_anchors:
+                        if candidate.anchor.startswith(boost_anchor):
+                            # Soft boost: увеличиваем final_score на 10%
+                            candidate.anchor_boost = 1.1
+                            logger.debug(f"Applied boost to anchor {candidate.anchor} for topic {topic}")
+                            break
+        
         # Step 4: Merge + final scoring
         for candidate in candidates:
             # Нормализация уже сделана в _merge_and_score_procedural
-            candidate.final_score = 0.55 * candidate.vector_score + 0.20 * candidate.fts_score + 0.25 * candidate.keyword_score
+            base_final_score = 0.55 * candidate.vector_score + 0.20 * candidate.fts_score + 0.25 * candidate.keyword_score
+            
+            # Применяем anchor boost если есть
+            if hasattr(candidate, 'anchor_boost'):
+                candidate.final_score = base_final_score * candidate.anchor_boost
+            else:
+                candidate.final_score = base_final_score
         
         # Сортируем по final_score
         candidates.sort(key=lambda x: x.final_score, reverse=True)
@@ -183,9 +217,13 @@ class ProceduralRetriever(BaseRetriever):
         
         return results
     
-    def _extract_topic_and_tokens(self, question: str) -> Tuple[Optional[str], List[str]]:
+    def _extract_topic_and_tokens(self, question: str, category: Optional[str] = None) -> Tuple[Optional[str], List[str]]:
         """
         Извлекает под-тему и ключевые токены из вопроса.
+        
+        Args:
+            question: Текст вопроса
+            category: Категория вопроса (например, "regulatory_principle")
         
         Returns:
             (topic, topic_tokens) - например ("encryption", ["encrypt", "encryption", ...])
@@ -197,12 +235,20 @@ class ProceduralRetriever(BaseRetriever):
         topic_tokens = []
         topic = None
         
-        # Проверяем известные темы
-        for topic_name, tokens in self.TOPIC_TOKENS.items():
-            if any(token in question_lower for token in tokens):
-                topic = topic_name
-                topic_tokens.extend(tokens)
-                break
+        # Если категория regulatory_principle, проверяем сначала minimum_necessary
+        if category == "regulatory_principle":
+            # Проверяем minimum necessary токены
+            if any(token in question_lower for token in self.TOPIC_TOKENS.get("minimum_necessary", [])):
+                topic = "minimum_necessary"
+                topic_tokens.extend(self.TOPIC_TOKENS["minimum_necessary"])
+        
+        # Проверяем другие известные темы (если еще не нашли)
+        if not topic:
+            for topic_name, tokens in self.TOPIC_TOKENS.items():
+                if topic_name != "minimum_necessary" and any(token in question_lower for token in tokens):
+                    topic = topic_name
+                    topic_tokens.extend(tokens)
+                    break
         
         # Добавляем общие токены требований
         topic_tokens.extend(self.REQUIREMENT_TOKENS)

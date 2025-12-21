@@ -35,7 +35,11 @@ def build_prompt(
     
     # Check if this is a yes/no question (procedural)
     is_yesno = meta.get('category') == 'procedural / best practices'
+    is_regulatory_principle = meta.get('category') == 'regulatory_principle'
+    
     yesno_instruction = ""
+    regulatory_principle_instruction = ""
+    
     if is_yesno:
         # Используем сигнал от ретривера, если есть
         yesno_signal = meta.get('yesno_signal', '')
@@ -51,6 +55,34 @@ def build_prompt(
             )
         else:
             yesno_instruction = "\n6. Start your answer with: YES / NO / UNCLEAR (based on the evidence in context)"
+    
+    # Special handling for regulatory_principle questions
+    if is_regulatory_principle:
+        # Extract the term/concept from the question if available
+        question_lower = question.lower()
+        term_match = None
+        import re
+        # Try to extract term from common patterns
+        for pattern in [
+            r'what does\s+["\']([^"\']+)["\']\s+mean',
+            r'what does\s+([A-Za-z\s]+?)\s+mean',
+            r'define\s+([A-Za-z\s]+?)(?:\s|$)',
+            r'what is\s+([A-Za-z\s]+?)(?:\s|$)',
+        ]:
+            match = re.search(pattern, question_lower, re.IGNORECASE)
+            if match:
+                term_match = match.group(1).strip()
+                break
+        
+        term = term_match if term_match else "the concept"
+        regulatory_principle_instruction = (
+            f"\n6. SPECIAL INSTRUCTIONS FOR REGULATORY PRINCIPLE:\n"
+            f"   - Start with: \"HIPAA does not provide a standalone definition of '{term}' in the Definitions section.\"\n"
+            f"   - Explain the regulatory meaning as a requirement/principle, not as a dictionary definition.\n"
+            f"   - DO NOT invent a definition like \"{term} means...\" if the context does not contain a formal definition.\n"
+            f"   - Instead, describe what HIPAA requires or how the principle applies based on the provided regulatory text.\n"
+            f"   - You MUST include 1-3 exact quotes with anchors from the context to support your explanation."
+        )
     
     system = """You are an expert on HIPAA regulations.
 Answer questions using exact quotes from the provided regulatory context.
@@ -86,6 +118,7 @@ Instructions:
 5. Quotes must be exact substrings from the corresponding context items
 6. If information is not found in the context, set answer to "insufficient context" and citations to []
 {yesno_instruction}
+{regulatory_principle_instruction}
 
 Return ONLY valid JSON, no additional text:"""
     

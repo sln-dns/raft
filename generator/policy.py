@@ -105,6 +105,11 @@ def choose_policy(
         logger.info(f"Выбран policy: QUOTED_ANSWER (category: {category})")
         return AnswerPolicy.QUOTED_ANSWER
     
+    # Правило 4.5: regulatory_principle -> QUOTED_ANSWER (принципы требуют объяснения с цитатами)
+    if category == "regulatory_principle":
+        logger.info(f"Выбран policy: QUOTED_ANSWER (category: {category})")
+        return AnswerPolicy.QUOTED_ANSWER
+    
     # Правило 5: procedural/best practices -> QUOTED_ANSWER (Yes/No/Unclear + цитата)
     if category == "procedural / best practices":
         logger.info(f"Выбран policy: QUOTED_ANSWER (category: {category})")

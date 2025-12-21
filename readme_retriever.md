@@ -36,6 +36,7 @@ retriever = get_retriever_for_category(
 |-----------|----------|------------|
 | `overview / purpose` | `OverviewPurposeRetriever` | Общий обзор и назначение |
 | `definition` | `DefinitionRetriever` | Определения терминов |
+| `regulatory_principle` | `ProceduralRetriever` | Регуляторные принципы (minimum necessary, reasonable safeguards и т.д.) |
 | `scope / applicability` | `ScopeRetriever` | Область применения |
 | `penalties` | `PenaltiesRetriever` | Штрафы и санкции |
 | `procedural / best practices` | `ProceduralRetriever` | Процедуры и best practices |
@@ -322,7 +323,8 @@ retriever = get_retriever_for_category(
 | `k` | `int` | `4` | Количество итоговых пунктов |
 | `seed_k` | `int` | `3` | Количество seed-чанков |
 | `expand_section` | `bool` | `True` | Добавлять соседние подпункты в той же секции |
-| `need_yesno` | `bool` | `True` | Формировать сигнал yes/no |
+| `need_yesno` | `bool` | `True` | Формировать сигнал yes/no (только для `procedural / best practices`) |
+| `category` | `Optional[str]` | `None` | Категория вопроса (используется для `regulatory_principle`) |
 
 ### Выходные данные
 
@@ -353,20 +355,27 @@ retriever = get_retriever_for_category(
 ```
 
 ### Алгоритм
-1. **Определение под-темы** и ключевых токенов (encryption, security, safeguards)
-2. **Подготовка FTS query** с усилением (security, safeguard, technical, administrative, physical, implementation specification)
+1. **Определение под-темы** и ключевых токенов:
+   - Для обычных procedural вопросов: encryption, security, safeguards
+   - Для `regulatory_principle` (если `category="regulatory_principle"`):
+     - Определяет тему (например, "minimum_necessary")
+     - Добавляет topic tokens: "minimum necessary", "reasonable efforts", "limit", "accomplish the intended purpose", "minimum amount", "reasonably necessary"
+2. **Подготовка FTS query** с усилением (security, safeguard, technical, administrative, physical, implementation specification + topic tokens)
 3. **Candidate retrieval** (hybrid):
    - Фильтры: `granularity = 'atomic'`, опционально `part IN [164]`
    - Fallback: если по Part 164 мало кандидатов, снимает фильтр part
 4. **Keyword evidence scoring**: усиление чанков с ключевыми словами
    - +1.0 если есть encryption/encrypt (для encryption-темы)
+   - +1.0 если есть minimum necessary tokens (для regulatory_principle темы "minimum_necessary")
    - +0.6 если есть implementation specification или addressable
    - +0.4 если есть safeguard(s) или security
    - +0.4 если есть модальные "must/required/shall"
    - -0.3 если встречается "not required"
-5. **Merge + final scoring**: `final_score = 0.55*vector_score + 0.20*fts_score_norm + 0.25*keyword_score`
-6. **Seed selection + expansion**: выбор `seed_k=3` лучших, расширение соседями (только с `keyword_score > 0`)
-7. **Формирование сигнала yes/no**: определяет `yesno_signal` и `yesno_rationale`
+5. **Soft boost для regulatory principles** (если `category="regulatory_principle"`):
+   - Для темы "minimum_necessary": применяет boost (×1.1) к final_score для anchors, начинающихся с "§164.502" или "§164.514"
+6. **Merge + final scoring**: `final_score = 0.55*vector_score + 0.20*fts_score_norm + 0.25*keyword_score` (с учетом anchor boost)
+7. **Seed selection + expansion**: выбор `seed_k=3` лучших, расширение соседями (только с `keyword_score > 0`)
+8. **Формирование сигнала yes/no**: определяет `yesno_signal` и `yesno_rationale` (только для `procedural / best practices`, не для `regulatory_principle`)
 
 ### Фильтры
 - `granularity = 'atomic'`
@@ -577,6 +586,40 @@ retriever = get_retriever_for_category(
 
 ### Особенность
 Возвращает структуру с `section_id` вместо `chunk_id`, поэтому в `app.py` используется специальная конвертация.
+
+---
+
+## Post-Classification Override
+
+Система включает слой post-classification override, который применяет доменные правила после классификации вопросов LLM.
+
+### Правила override
+
+Если вопрос матчится под паттерн:
+- "what does 'X' mean" / "what does X mean" / "define X" / "what is X" / "explain X"
+
+И `X` в словаре регуляторных концепций:
+- minimum necessary
+- reasonable safeguards
+- addressable implementation specification
+- administrative safeguards
+- technical safeguards
+- physical safeguards
+- reasonable and appropriate
+- covered entity
+- business associate
+- protected health information
+- phi
+- individually identifiable health information
+
+То категория переопределяется на `regulatory_principle` (если изначально была `definition`).
+
+### Модуль
+- Файл: `classification_override.py`
+- Функция: `apply_classification_override(classification, question) -> QuestionClassification`
+
+### Использование
+Override применяется автоматически в `app.py` после классификации и перед выбором ретривера.
 
 ---
 

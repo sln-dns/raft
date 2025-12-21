@@ -73,8 +73,14 @@ def validate_citation(
     """
     Валидирует одну citation из LLM ответа.
     
-    Если anchor валиден, но quote не найден в text_raw, и auto_fix_quote=True,
-    автоматически заменяет quote на релевантный фрагмент из text_raw.
+    СТРОГАЯ валидация anchors:
+    - Anchor должен точно совпадать с anchor в context_items (без поблажек)
+    - Придуманные/несуществующие anchors отклоняются
+    
+    Автоматическое исправление quotes:
+    - Если anchor валиден, но quote не найден в text_raw, и auto_fix_quote=True,
+      автоматически заменяет quote на релевантный фрагмент из text_raw
+    - Quote всегда берется из text_raw соответствующего context item
     
     Args:
         citation: Словарь с anchor и quote из LLM
@@ -82,7 +88,7 @@ def validate_citation(
         auto_fix_quote: Если True, автоматически исправляет quote при валидном anchor
     
     Returns:
-        Валидный Citation или None, если валидация не прошла
+        Валидный Citation или None, если валидация не прошла (anchor не найден в контексте)
     """
     anchor = citation.get("anchor", "").strip()
     quote = citation.get("quote", "").strip()
@@ -91,15 +97,26 @@ def validate_citation(
         logger.warning(f"Citation missing anchor: {citation}")
         return None
     
-    # Ищем соответствующий context item по anchor
+    # СТРОГАЯ валидация anchor: anchor должен точно совпадать с контекстом
+    # Ищем соответствующий context item по anchor (точное совпадение)
     matching_item = None
+    anchor_normalized = anchor.strip()
+    
     for item in context_items:
-        if item.anchor and item.anchor.strip() == anchor:
-            matching_item = item
-            break
+        if item.anchor:
+            item_anchor_normalized = item.anchor.strip()
+            # Строгое сравнение: anchor должен точно совпадать
+            if item_anchor_normalized == anchor_normalized:
+                matching_item = item
+                break
     
     if not matching_item:
-        logger.warning(f"Anchor '{anchor}' not found in context items")
+        # Проверяем, есть ли похожие anchors в контексте (для отладки)
+        available_anchors = [item.anchor for item in context_items if item.anchor]
+        logger.warning(
+            f"Anchor '{anchor}' not found in context items. "
+            f"Available anchors: {available_anchors[:10] if available_anchors else 'none'}"
+        )
         return None
     
     # Если quote отсутствует, но auto_fix_quote включен - извлекаем релевантный фрагмент
@@ -248,9 +265,15 @@ def parse_and_validate_citations(
             # Проверяем, был ли quote исправлен
             if auto_fix_quote and original_quote and valid_citation.quote != original_quote:
                 auto_fixed_count += 1
+                logger.info(
+                    f"Auto-fixed citation for anchor {valid_citation.anchor}: "
+                    f"original quote length {len(original_quote)}, fixed quote length {len(valid_citation.quote)}"
+                )
             valid_citations.append(valid_citation)
         else:
-            logger.debug(f"Invalid citation filtered out: {citation_data}")
+            logger.warning(
+                f"Invalid citation filtered out (anchor not in context or quote validation failed): {citation_data}"
+            )
     
     # Если citations обязательны и их нет - возвращаем ошибку
     if require_citations and not valid_citations:

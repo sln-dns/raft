@@ -127,6 +127,11 @@ async def classify_question(request: QuestionRequest):
     try:
         logger.info(f"Классификация вопроса: {request.question[:100]}...")
         classification = classifier.classify(request.question)
+        logger.info(f"Категория (before override): {classification.category}")
+        
+        # Применение post-classification override
+        from classification_override import apply_classification_override
+        classification = apply_classification_override(classification, request.question)
         
         result = ClassificationResponse(
             category=classification.category,
@@ -228,8 +233,14 @@ async def generate_answer(request: QuestionRequest):
         logger.info(f"Генерация ответа на вопрос: {request.question[:100]}...")
         
         # 1. Классификация вопроса
-        classification = classifier.classify(request.question)
-        logger.info(f"Категория: {classification.category}")
+        initial_classification = classifier.classify(request.question)
+        logger.info(f"Категория (before override): {initial_classification.category}")
+        
+        # 1.1. Применение post-classification override (доменные правила)
+        from classification_override import apply_classification_override
+        classification = apply_classification_override(initial_classification, request.question)
+        if classification.category != initial_classification.category:
+            logger.info(f"Категория (after override): {classification.category} (was: {initial_classification.category})")
         
         # 2. Создание эмбеддинга для вопроса
         question_embedding = embedding_client.create_embedding(request.question)
@@ -242,7 +253,8 @@ async def generate_answer(request: QuestionRequest):
         retrieved_chunks_raw = await retriever.retrieve(
             question_embedding=question_embedding,
             max_results=request.max_results,
-            question=request.question
+            question=request.question,
+            category=classification.category  # Передаем категорию для поддержки regulatory_principle
         )
         
         # Конвертируем в формат API

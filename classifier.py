@@ -15,6 +15,7 @@ class QuestionClassification(BaseModel):
     category: Literal[
         "overview / purpose",
         "definition",
+        "regulatory_principle",
         "scope / applicability",
         "penalties",
         "procedural / best practices",
@@ -33,7 +34,8 @@ class QuestionClassifier:
     # Описания категорий для промпта
     CATEGORY_DESCRIPTIONS = {
         "overview / purpose": "Общий обзор, цель регуляций, какие части покрывают",
-        "definition": "Определения терминов (что означает X)",
+        "definition": "Определения терминов (что означает X) - простые термины из словаря",
+        "regulatory_principle": "Регуляторные принципы и концепции (minimum necessary, reasonable safeguards, addressable implementation specification и т.д.) - нормативные принципы, требующие объяснения контекста применения",
         "scope / applicability": "Область применения, какие сущности подпадают под регуляции",
         "penalties": "Гражданские штрафы, наказания",
         "procedural / best practices": "Процедуры, лучшие практики, шифрование, меры защиты",

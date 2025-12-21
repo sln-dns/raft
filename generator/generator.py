@@ -233,12 +233,13 @@ class AnswerGenerator:
         # Для QUOTED_ANSWER и LISTING парсим JSON и валидируем citations
         if answer_policy in (AnswerPolicy.QUOTED_ANSWER, AnswerPolicy.LISTING):
             # Определяем, обязательны ли citations
-            require_citations = classification.category in ("definition", "procedural / best practices")
+            require_citations = classification.category in ("definition", "regulatory_principle", "procedural / best practices")
             
             answer_text, citations = parse_and_validate_citations(
                 llm_response=llm_response,
                 context_items=context_items,
-                require_citations=require_citations
+                require_citations=require_citations,
+                auto_fix_quote=True  # Явно включаем auto-fix для quote при валидном anchor
             )
         else:
             # Для остальных политик используем старый метод

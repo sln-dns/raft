@@ -35,6 +35,7 @@ def get_retriever_for_category(category: str, question: Optional[str] = None, db
     retriever_map = {
         "overview / purpose": OverviewPurposeRetriever,
         "definition": DefinitionRetriever,
+        "regulatory_principle": ProceduralRetriever,  # Используем ProceduralRetriever для принципов
         "scope / applicability": ScopeRetriever,
         "penalties": PenaltiesRetriever,
         "procedural / best practices": ProceduralRetriever,
