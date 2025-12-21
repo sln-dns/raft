@@ -74,7 +74,8 @@ class AnswerResponse(BaseModel):
     classification: ClassificationResponse
     retrieved_chunks: List[RetrievedChunk]
     answer: str
-    sources: List[str]  # Список chunk_id или anchor для цитирования
+    sources: List[str]  # Список anchor или chunk_id для цитирования (из citations)
+    debug: Optional[Dict[str, Any]] = None  # Опциональные метаданные для отладки
 
 
 # Глобальные объекты
@@ -274,6 +275,25 @@ async def generate_answer(request: QuestionRequest):
         
         logger.info(f"Найдено чанков: {len(retrieved_chunks)}")
         
+        # Извлекаем сигналы из результатов ретривера
+        retriever_signals = {}
+        
+        # Для procedural: yesno_signal и yesno_rationale из первого элемента
+        if classification.category == "procedural / best practices" and retrieved_chunks_raw:
+            first_chunk = retrieved_chunks_raw[0]
+            if "yesno_signal" in first_chunk:
+                retriever_signals["yesno_signal"] = first_chunk.get("yesno_signal")
+                retriever_signals["yesno_rationale"] = first_chunk.get("yesno_rationale", "")
+                logger.info(f"Retriever yesno_signal: {retriever_signals['yesno_signal']}")
+        
+        # Для disclosure: policy_signal из любого элемента (обычно одинаковый)
+        if classification.category == "permission / disclosure" and retrieved_chunks_raw:
+            for chunk in retrieved_chunks_raw:
+                if "policy_signal" in chunk:
+                    retriever_signals["policy_signal"] = chunk.get("policy_signal")
+                    logger.info(f"Retriever policy_signal: {retriever_signals['policy_signal']}")
+                    break
+        
         # 4. Генерация ответа
         from generator import get_generator
         generator = get_generator()
@@ -290,14 +310,41 @@ async def generate_answer(request: QuestionRequest):
             for chunk in retrieved_chunks
         ]
         
-        answer = await generator.generate(
+        generation_result = await generator.generate(
             question=request.question,
             chunks=chunks_for_generator,
-            classification=classification
+            classification=classification,
+            retriever_signals=retriever_signals
         )
         
-        # 5. Формирование списка источников
-        sources = [chunk.chunk_id for chunk in retrieved_chunks[:3]]  # Топ-3 источника
+        # 5. Формирование списка источников из citations
+        # Приоритет: anchor, fallback на chunk_id
+        sources = []
+        if generation_result.citations:
+            # Используем citations из генератора (валидированные)
+            for citation in generation_result.citations:
+                if citation.anchor:
+                    sources.append(citation.anchor)
+                elif citation.chunk_id:
+                    sources.append(citation.chunk_id)
+        else:
+            # Fallback: если citations нет, используем топ-3 chunk_id из retrieved_chunks
+            sources = [chunk.chunk_id for chunk in retrieved_chunks[:3]]
+            logger.warning("No citations in generation result, using fallback sources from retrieved_chunks")
+        
+        # Убираем дубликаты, сохраняя порядок
+        seen = set()
+        unique_sources = []
+        for source in sources:
+            if source not in seen:
+                seen.add(source)
+                unique_sources.append(source)
+        sources = unique_sources
+        
+        # Формируем debug информацию (опционально)
+        debug_info = None
+        if generation_result.meta:
+            debug_info = generation_result.meta
         
         return AnswerResponse(
             question=request.question,
@@ -307,8 +354,9 @@ async def generate_answer(request: QuestionRequest):
                 reasoning=classification.reasoning
             ),
             retrieved_chunks=retrieved_chunks,
-            answer=answer,
-            sources=sources
+            answer=generation_result.answer_text,  # Используем answer_text напрямую
+            sources=sources,
+            debug=debug_info
         )
         
     except Exception as e:
