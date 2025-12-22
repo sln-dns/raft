@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 
 
 # Словарь регуляторных концепций/принципов (не простые определения)
+# Примечание: "business associate", "covered entity" и другие формально определенные термины
+# НЕ должны быть здесь - они являются определениями (definitions), а не принципами
 REGULATORY_CONCEPTS = {
     "minimum necessary",
     "reasonable safeguards",
@@ -22,8 +24,6 @@ REGULATORY_CONCEPTS = {
     "technical safeguards",
     "physical safeguards",
     "reasonable and appropriate",
-    "covered entity",
-    "business associate",
     "protected health information",
     "phi",
     "individually identifiable health information",
