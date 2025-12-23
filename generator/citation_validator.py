@@ -26,6 +26,44 @@ def normalize_whitespace(text: str) -> str:
     return text.strip()
 
 
+def is_incomplete_quote(text: str) -> bool:
+    """
+    Определяет, является ли цитата неполной (заголовок подпункта, заканчивающийся на ":").
+    
+    Шаг 1: Детектор "incomplete citation" для режима STRICT_CITATION.
+    Если цитата заканчивается на ":", это обычно заголовок подпункта, который нужно
+    дополнить дочерними подпунктами.
+    
+    Args:
+        text: Текст цитаты для проверки
+    
+    Returns:
+        True, если цитата выглядит как неполная (заголовок подпункта)
+    """
+    if not text:
+        return False
+    
+    text_stripped = text.rstrip()
+    
+    # Основная эвристика: заканчивается на ":"
+    if text_stripped.endswith(":"):
+        return True
+    
+    # Опциональная эвристика: паттерны типа "may disclose protected health information:"
+    # (заголовок с двоеточием в конце)
+    incomplete_patterns = [
+        r'may disclose protected health information:$',
+        r'may use or disclose protected health information:$',
+        r'permitted uses and disclosures:$',
+    ]
+    
+    for pattern in incomplete_patterns:
+        if re.search(pattern, text_stripped, re.IGNORECASE):
+            return True
+    
+    return False
+
+
 def normalize_anchor(anchor: str) -> str:
     """
     Нормализует anchor для более мягкого сравнения.

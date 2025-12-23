@@ -82,6 +82,32 @@ class AnswerGenerator:
                     chunk_id=item.chunk_id
                 ))
         
+        # Шаг 6: "Last line of defense" - если финальный ответ заканчивается на ":"
+        # НО: не применяем для standard_header (например, "(f) Standard: ...")
+        if answer_lines:
+            # Проверяем последнюю строку
+            last_line = answer_lines[-1]
+            if last_line.rstrip().endswith(":"):
+                # Проверяем, является ли это standard_header (паттерн "(x) Standard:")
+                import re
+                is_standard_header = bool(re.search(r"\([a-z]\)\s+Standard:", last_line, re.IGNORECASE))
+                
+                if is_standard_header:
+                    # Standard header - допустимая цитата, оставляем как есть
+                    logger.info(f"Last line is standard header, keeping as-is: {last_line[:50]}...")
+                else:
+                    # Не standard header - применяем "last line of defense"
+                    # Удаляем последнюю строку, если есть другие
+                    if len(answer_lines) > 1:
+                        answer_lines.pop()
+                        citations.pop()  # Удаляем соответствующую citation
+                        logger.warning(f"Removed last line ending with ':' from STRICT_CITATION answer (had {len(answer_lines) + 1} lines, kept {len(answer_lines)})")
+                    else:
+                        # Если это единственная цитата - заменяем на сообщение об ошибке
+                        answer_lines = ["No complete regulatory text available for the requested citation scope."]
+                        citations = []
+                        logger.warning(f"Replaced single citation ending with ':' with error message")
+        
         answer_text = "\n".join(answer_lines) if answer_lines else "No citations with anchors found."
         
         # Метаданные

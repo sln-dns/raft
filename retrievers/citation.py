@@ -14,6 +14,151 @@ from embeddings import get_embedding_client
 logger = logging.getLogger(__name__)
 
 
+# Шаг 1: Классификация "colon type" для обработки incomplete цитат
+def ends_with_colon(text: str) -> bool:
+    """
+    Проверяет, заканчивается ли текст на двоеточие.
+    
+    Args:
+        text: Текст для проверки
+    
+    Returns:
+        True, если текст заканчивается на ':'
+    """
+    if not text:
+        return False
+    return text.rstrip().endswith(":")
+
+
+def is_list_introducer(text: str) -> bool:
+    """
+    Проверяет, является ли текст вводом к списку (list introducer).
+    
+    Возвращает True если текст явно вводит список и должен продолжаться:
+    - содержит (case-insensitive) любые из паттернов:
+      * "may disclose protected health information:"
+      * "the following:"
+      * "as follows:"
+      * "includes:"
+      * "pursuant to the following:"
+    
+    Важно: "(x) Standard:" НЕ является list introducer (это заголовок стандарта).
+    
+    Args:
+        text: Текст для проверки
+    
+    Returns:
+        True, если текст является list introducer
+    """
+    if not text:
+        return False
+    
+    # Шаг 1: Проверяем, не является ли это стандартным заголовком
+    # "(x) Standard:" никогда не считается list introducer
+    if re.search(r"\([a-z]\)\s+Standard:", text, re.IGNORECASE):
+        return False
+    
+    text_lower = text.lower()
+    
+    list_introducer_patterns = [
+        r"may disclose protected health information:",
+        r"the following:",
+        r"as follows:",
+        r"includes:",
+        r"pursuant to the following:",
+    ]
+    
+    for pattern in list_introducer_patterns:
+        if re.search(pattern, text_lower):
+            return True
+    
+    return False
+
+
+def is_standard_header(text: str) -> bool:
+    """
+    Проверяет, является ли текст заголовочным "Standard:" и его допустимо цитировать целиком.
+    
+    True если:
+    - содержит паттерн "(x) Standard:" (regex r"\([a-z]\)\s+Standard:", case-insensitive)
+    - и НЕ является list_introducer
+    
+    Args:
+        text: Текст для проверки
+    
+    Returns:
+        True, если текст является standard header
+    """
+    if not text:
+        return False
+    
+    # Проверяем паттерн "(x) Standard:"
+    standard_pattern = r"\([a-z]\)\s+Standard:"
+    if not re.search(standard_pattern, text, re.IGNORECASE):
+        return False
+    
+    # НЕ должен быть list_introducer
+    if is_list_introducer(text):
+        return False
+    
+    return True
+
+
+# Adaptive widening helpers для CitationRetriever
+def strip_last_paren(anchor_prefix: str) -> Optional[str]:
+    """
+    Удаляет последнюю скобку с содержимым из anchor prefix.
+    
+    Примеры:
+        "§164.512(f)(1)" -> "§164.512(f)"
+        "§164.512(f)" -> "§164.512"
+        "§164.512" -> None (нельзя расширить дальше)
+    
+    Args:
+        anchor_prefix: Anchor prefix (например, "§164.512(f)(1)")
+    
+    Returns:
+        Расширенный prefix или None, если нельзя расширить
+    """
+    if not anchor_prefix:
+        return None
+    
+    # Ищем последнюю скобку с содержимым: (x) или (x)(y)
+    # Паттерн: \(([a-z0-9]+)\) в конце строки
+    match = re.search(r'\([a-z0-9]+\)$', anchor_prefix)
+    if match:
+        # Удаляем последнюю скобку
+        return anchor_prefix[:match.start()]
+    
+    return None
+
+
+def strip_to_section(anchor_prefix: str) -> Optional[str]:
+    """
+    Расширяет anchor prefix до уровня секции (удаляет все подпункты).
+    
+    Примеры:
+        "§164.512(f)(1)" -> "§164.512"
+        "§164.512(f)" -> "§164.512"
+        "§164.512" -> "§164.512" (без изменений)
+    
+    Args:
+        anchor_prefix: Anchor prefix (например, "§164.512(f)(1)")
+    
+    Returns:
+        Prefix на уровне секции или None
+    """
+    if not anchor_prefix:
+        return None
+    
+    # Ищем паттерн §XXX.XXX (секция)
+    match = re.search(r'^§\d+\.\d+', anchor_prefix)
+    if match:
+        return match.group(0)
+    
+    return None
+
+
 class CitationRetriever(BaseRetriever):
     """
     Ретривер для вопросов типа 'citation-required' - строгое цитирование.
@@ -74,38 +219,247 @@ class CitationRetriever(BaseRetriever):
         question = question or ""
         k = min(k, max_results, 10)  # Максимум 10 цитат
         
-        # Step 0: Зафиксировать "юрисдикцию" (scope)
+        # Step 0: Зафиксировать "юрисдикцию" (scope) - anchor_prefix как "prefer", не жесткий
         if not anchor_prefix:
             anchor_prefix = self.infer_anchor_prefix(question)
         
-        anchor_like = f"{anchor_prefix}%" if anchor_prefix else None
+        # Adaptive widening: если по строгому prefix ничего не найдено, расширяем scope
+        effective_prefix = anchor_prefix
+        original_prefix = anchor_prefix
         
-        logger.info(f"CitationRetriever (from new module): question='{question[:50]}...', anchor_prefix={anchor_prefix}, anchor_like={anchor_like}, k={k}")
+        # Генерируем список префиксов для widening (от самого узкого к широкому)
+        widening_prefixes = [anchor_prefix] if anchor_prefix else []
+        if anchor_prefix:
+            # Пробуем расширить до родительского уровня
+            parent_prefix = strip_last_paren(anchor_prefix)
+            if parent_prefix:
+                widening_prefixes.append(parent_prefix)
+                # Пробуем расширить до уровня секции
+                section_prefix = strip_to_section(anchor_prefix)
+                if section_prefix and section_prefix != parent_prefix:
+                    widening_prefixes.append(section_prefix)
         
-        # Step 1: Candidate retrieval: vector search по atomic + hard filter по anchor prefix
-        vector_candidates = await self._vector_search_citation(
-            question_embedding=question_embedding,
-            doc_id=doc_id,
-            anchor_like=anchor_like,
-            limit=50
-        )
-        logger.info(f"Vector кандидатов: {len(vector_candidates)}")
+        logger.info(f"CitationRetriever: question='{question[:50]}...', original_anchor_prefix={original_prefix}, widening_prefixes={widening_prefixes}, k={k}")
         
-        # Step 2 (optional): FTS внутри уже отфильтрованного anchor scope
-        fts_candidates = []
-        if question and question.strip():
-            boost_words = [
-                "law enforcement", "police", "court", "warrant",
-                "subpoena", "administrative request", "disclosure", "disclose"
-            ]
-            fts_query = build_fts_query(question, boost_words)
-            fts_candidates = await self._fts_search_citation(
-                fts_query=fts_query,
+        # Шаг 2: Hard fallback to broader prefix - пробуем каждый prefix, пока не получим валидные результаты
+        # Это цикл по widening_prefixes, который продолжается до получения непустых results
+        final_results = []
+        tried_prefixes = []
+        
+        for attempt_prefix in widening_prefixes:
+            tried_prefixes.append(attempt_prefix)
+            test_anchor_like = f"{attempt_prefix}%"
+            
+            logger.info(f"Attempting retrieval with prefix: {attempt_prefix}")
+            
+            # Step 1: Vector search
+            test_vector = await self._vector_search_citation(
+                question_embedding=question_embedding,
                 doc_id=doc_id,
-                anchor_like=anchor_like,
+                anchor_like=test_anchor_like,
                 limit=50
             )
-            logger.info(f"FTS кандидатов: {len(fts_candidates)}")
+            
+            # Step 2: FTS search
+            test_fts = []
+            if question and question.strip():
+                boost_words = [
+                    "law enforcement", "police", "court", "warrant",
+                    "subpoena", "administrative request", "disclosure", "disclose"
+                ]
+                fts_query = build_fts_query(question, boost_words)
+                test_fts = await self._fts_search_citation(
+                    fts_query=fts_query,
+                    doc_id=doc_id,
+                    anchor_like=test_anchor_like,
+                    limit=50
+                )
+            
+            total_found = len(test_vector) + len(test_fts)
+            
+            if total_found == 0:
+                logger.debug(f"No candidates found for prefix {attempt_prefix}, trying next level...")
+                continue
+            
+            # Нашли кандидатов - обрабатываем их
+            effective_prefix = attempt_prefix
+            effective_anchor_like = test_anchor_like
+            vector_candidates = test_vector
+            fts_candidates = test_fts
+            
+            if attempt_prefix != original_prefix:
+                logger.info(f"Widening scope: {original_prefix} -> {attempt_prefix} (found {total_found} candidates: {len(test_vector)} vector + {len(test_fts)} FTS)")
+            else:
+                logger.info(f"Found {total_found} candidates with original prefix {attempt_prefix} ({len(test_vector)} vector + {len(test_fts)} FTS)")
+            
+            # Обрабатываем кандидатов для этого prefix
+            # Step 3: Merge + selection
+            merged = self._merge_and_score_citation(vector_candidates, fts_candidates)
+            
+            # Фильтруем по min_relevance если задан
+            if min_relevance:
+                merged = [c for c in merged if c.final_score >= min_relevance]
+            
+            # Выбираем top seed_k
+            seeds = merged[:seed_k]
+            logger.info(f"Выбрано seed-чанков: {len(seeds)}")
+            
+            all_results = list(seeds)
+            
+            # Step 4: Coverage expansion (собрать подпункты)
+            if expand_section and effective_anchor_like:
+                expanded = await self._expand_coverage(seeds, doc_id, effective_anchor_like, k)
+                logger.info(f"Найдено expanded-чанков: {len(expanded)}")
+                all_results.extend(expanded)
+            
+            # Дедупликация и выбор top-k
+            final_results = self._dedup_and_select_citation(all_results, k)
+            
+            logger.info(f"Финальных результатов (до фильтрации incomplete) для prefix {attempt_prefix}: {len(final_results)}")
+            
+            # Шаг 2: Классификация и фильтрация чанков с двоеточием
+            list_introducer_seeds = []
+            standard_header_results = []
+            colon_unknown_type = []
+            complete_results = []
+            
+            for candidate in final_results:
+                if ends_with_colon(candidate.text_raw):
+                    if is_standard_header(candidate.text_raw):
+                        standard_header_results.append(candidate)
+                        logger.info(f"Standard header detected: anchor={candidate.anchor}, text_raw='{candidate.text_raw[:50]}...'")
+                    elif is_list_introducer(candidate.text_raw):
+                        list_introducer_seeds.append(candidate)
+                        logger.info(f"List introducer detected: anchor={candidate.anchor}, text_raw='{candidate.text_raw[:50]}...'")
+                    else:
+                        colon_unknown_type.append(candidate)
+                        logger.warning(f"Colon unknown type: anchor={candidate.anchor}, text_raw='{candidate.text_raw[:50]}...'")
+                else:
+                    complete_results.append(candidate)
+            
+            # Шаг 3 и 4: Coverage completion для list introducer seeds
+            expanded_from_list_introducers = []
+            incomplete_warnings = []
+            
+            for list_introducer_seed in list_introducer_seeds:
+                if not list_introducer_seed.anchor:
+                    incomplete_warnings.append(f"list_introducer_no_anchor: {list_introducer_seed.chunk_id}")
+                    continue
+                
+                children = await self._expand_incomplete_seed(
+                    seed_anchor=list_introducer_seed.anchor,
+                    doc_id=doc_id,
+                    limit=12
+                )
+                
+                if children:
+                    list_introducer_seed.explanation = "list_introducer_header"
+                    expanded_from_list_introducers.append(list_introducer_seed)
+                    for child in children[:6]:
+                        child.explanation = f"expanded_from_list_introducer:{list_introducer_seed.anchor}"
+                        expanded_from_list_introducers.append(child)
+                    logger.info(f"Expanded list introducer {list_introducer_seed.anchor}: added seed + {min(len(children), 6)} child subparagraphs")
+                else:
+                    if is_standard_header(list_introducer_seed.text_raw):
+                        standard_header_results.append(list_introducer_seed)
+                        logger.info(f"Fallback A: list introducer {list_introducer_seed.anchor} is also standard header - returning as-is")
+                    else:
+                        siblings = await self._get_sibling_chunks(
+                            seed=list_introducer_seed,
+                            doc_id=doc_id,
+                            anchor_like=effective_anchor_like,
+                            limit=12
+                        )
+                        if siblings:
+                            for sibling in siblings:
+                                sibling.explanation = f"expanded_from_list_introducer_siblings:{list_introducer_seed.anchor}"
+                                expanded_from_list_introducers.append(sibling)
+                            logger.info(f"Fallback B: list introducer {list_introducer_seed.anchor} - found {len(siblings)} sibling chunks")
+                        else:
+                            # Fallback C: нет детей и siblings - это нормально, будет расширение до более широкого prefix
+                            logger.warning(f"List introducer {list_introducer_seed.anchor} has no children and no siblings - will try broader prefix")
+            
+            # Объединяем все результаты
+            all_final_results = (
+                list(complete_results) + 
+                standard_header_results + 
+                expanded_from_list_introducers + 
+                colon_unknown_type
+            )
+            
+            # Дедупликация
+            seen_chunk_ids = set()
+            deduped_results = []
+            for candidate in all_final_results:
+                if candidate.chunk_id not in seen_chunk_ids:
+                    seen_chunk_ids.add(candidate.chunk_id)
+                    deduped_results.append(candidate)
+            
+            deduped_results.sort(key=lambda x: x.anchor or "")
+            final_results = deduped_results
+            
+            logger.info(f"Финальных результатов (после фильтрации incomplete и expansion) для prefix {attempt_prefix}: {len(final_results)}")
+            
+            # Проверяем, если остался только standard_header без дочерних подпунктов - расширяемся до §164.512
+            if final_results and len(final_results) == 1:
+                single_result = final_results[0]
+                # Проверяем, является ли это standard_header (паттерн "(x) Standard:")
+                if single_result.anchor and single_result.text_raw:
+                    is_standard_header_only = is_standard_header(single_result.text_raw)
+                    # Проверяем, что anchor не равен §164.512 (чтобы не зациклиться)
+                    # И что это не самый широкий prefix (чтобы не расширяться бесконечно)
+                    if is_standard_header_only and single_result.anchor != "§164.512" and attempt_prefix != "§164.512":
+                        logger.info(f"Only standard header found ({single_result.anchor}), expanding to broader prefix (current: {attempt_prefix})")
+                        # Продолжаем цикл, чтобы попробовать более широкий prefix
+                        continue
+            
+            # Если получили валидные результаты - останавливаемся
+            if final_results:
+                logger.info(f"Successfully retrieved {len(final_results)} results with prefix {attempt_prefix}")
+                break
+            else:
+                logger.warning(f"No valid results for prefix {attempt_prefix} after processing, trying next level...")
+        
+        # Шаг 3: Если все еще пусто - fallback на §164.512 целиком
+        if not final_results:
+            logger.warning(f"No results after trying all prefixes: {tried_prefixes}, attempting fallback to §164.512")
+            final_results = await self._fallback_to_section_164_512(doc_id, question_embedding, question, k)
+        
+        # Конвертируем в формат API
+        results = []
+        for candidate in final_results:
+            result_dict = {
+                "chunk_id": candidate.chunk_id,
+                "anchor": candidate.anchor,
+                "text_raw": candidate.text_raw,
+                "section_id": candidate.section_id,
+                "section_number": candidate.section_number,
+                "section_title": candidate.section_title,
+                "page_start": candidate.page_start,
+                "page_end": candidate.page_end,
+                "scores": {
+                    "vector_score": candidate.vector_score,
+                    "fts_score": candidate.fts_score,
+                    "final_score": candidate.final_score
+                },
+                "explanation": getattr(candidate, 'explanation', 'citation retrieval')
+            }
+            
+            explanation = getattr(candidate, 'explanation', '')
+            if explanation:
+                if explanation.startswith('expanded_from_list_introducer:'):
+                    expanded_from_anchor = explanation.split(':', 1)[1]
+                    result_dict["flags"] = {"expanded_from": expanded_from_anchor, "type": "list_introducer_child"}
+                elif explanation.startswith('expanded_from_list_introducer_siblings:'):
+                    expanded_from_anchor = explanation.split(':', 1)[1]
+                    result_dict["flags"] = {"expanded_from": expanded_from_anchor, "type": "sibling"}
+                elif explanation == "list_introducer_header":
+                    result_dict["flags"] = {"type": "list_introducer_header"}
+            
+            results.append(result_dict)
+        
+        logger.info(f"Final results count: {len(results)}")
+        return results
         
         # Step 3: Merge + selection
         merged = self._merge_and_score_citation(vector_candidates, fts_candidates)
@@ -121,20 +475,132 @@ class CitationRetriever(BaseRetriever):
         all_results = list(seeds)
         
         # Step 4: Coverage expansion (собрать подпункты)
-        if expand_section and anchor_like:
-            expanded = await self._expand_coverage(seeds, doc_id, anchor_like, k)
+        if expand_section and effective_anchor_like:
+            expanded = await self._expand_coverage(seeds, doc_id, effective_anchor_like, k)
             logger.info(f"Найдено expanded-чанков: {len(expanded)}")
             all_results.extend(expanded)
         
         # Дедупликация и выбор top-k
         final_results = self._dedup_and_select_citation(all_results, k)
         
-        logger.info(f"Финальных результатов: {len(final_results)}")
+        logger.info(f"Финальных результатов (до фильтрации incomplete): {len(final_results)}")
+        
+        # Шаг 2: Классификация и фильтрация чанков с двоеточием
+        list_introducer_seeds = []  # Нуждаются в expansion
+        standard_header_results = []  # Допустимые цитаты (Standard:)
+        colon_unknown_type = []  # Неизвестный тип, но оставляем (fail-soft)
+        complete_results = []
+        
+        for candidate in final_results:
+            if ends_with_colon(candidate.text_raw):
+                # Классифицируем тип двоеточия
+                if is_standard_header(candidate.text_raw):
+                    # Standard header - допустимая цитата, оставляем
+                    standard_header_results.append(candidate)
+                    logger.info(f"Standard header detected: anchor={candidate.anchor}, text_raw='{candidate.text_raw[:50]}...'")
+                elif is_list_introducer(candidate.text_raw):
+                    # List introducer - нуждается в expansion
+                    list_introducer_seeds.append(candidate)
+                    logger.info(f"List introducer detected: anchor={candidate.anchor}, text_raw='{candidate.text_raw[:50]}...'")
+                else:
+                    # Неизвестный тип - оставляем (fail-soft), но логируем
+                    colon_unknown_type.append(candidate)
+                    logger.warning(f"Colon unknown type: anchor={candidate.anchor}, text_raw='{candidate.text_raw[:50]}...'")
+            else:
+                # Полные цитаты добавляем в финальный output
+                complete_results.append(candidate)
+        
+        if list_introducer_seeds:
+            logger.info(f"Found {len(list_introducer_seeds)} list introducers (needs expansion), kept {len(complete_results)} complete quotes")
+        if standard_header_results:
+            logger.info(f"Found {len(standard_header_results)} standard headers (allowed as-is)")
+        if colon_unknown_type:
+            logger.info(f"Found {len(colon_unknown_type)} colon unknown type (kept as fail-soft)")
+        
+        # Шаг 3 и 4: Coverage completion для list introducer seeds
+        expanded_from_list_introducers = []
+        incomplete_warnings = []
+        
+        for list_introducer_seed in list_introducer_seeds:
+            if not list_introducer_seed.anchor:
+                incomplete_warnings.append(f"list_introducer_no_anchor: {list_introducer_seed.chunk_id}")
+                continue
+            
+            # Ищем дочерние подпункты для list introducer seed
+            children = await self._expand_incomplete_seed(
+                seed_anchor=list_introducer_seed.anchor,
+                doc_id=doc_id,
+                limit=12
+            )
+            
+            if children:
+                # Добавляем seed + дочерние подпункты (seed + 2-6 детей)
+                # Добавляем seed (заголовок списка)
+                list_introducer_seed.explanation = "list_introducer_header"
+                expanded_from_list_introducers.append(list_introducer_seed)
+                
+                # Добавляем дочерние подпункты (2-6 лучших)
+                for child in children[:6]:
+                    child.explanation = f"expanded_from_list_introducer:{list_introducer_seed.anchor}"
+                    expanded_from_list_introducers.append(child)
+                
+                logger.info(f"Expanded list introducer {list_introducer_seed.anchor}: added seed + {min(len(children), 6)} child subparagraphs")
+            else:
+                # Шаг 4: Fail-soft fallback - если детей нет
+                # Fallback A: если это standard header - вернуть seed целиком
+                # (Примечание: это маловероятно, так как is_standard_header уже проверяет !is_list_introducer,
+                # но оставляем для безопасности)
+                if is_standard_header(list_introducer_seed.text_raw):
+                    standard_header_results.append(list_introducer_seed)
+                    logger.info(f"Fallback A: list introducer {list_introducer_seed.anchor} is also standard header - returning as-is")
+                else:
+                    # Fallback B: вернуть sibling chunks из той же секции
+                    siblings = await self._get_sibling_chunks(
+                        seed=list_introducer_seed,
+                        doc_id=doc_id,
+                        anchor_like=effective_anchor_like,
+                        limit=12
+                    )
+                    
+                    if siblings:
+                        for sibling in siblings:
+                            sibling.explanation = f"expanded_from_list_introducer_siblings:{list_introducer_seed.anchor}"
+                            expanded_from_list_introducers.append(sibling)
+                        logger.info(f"Fallback B: list introducer {list_introducer_seed.anchor} - found {len(siblings)} sibling chunks")
+                    else:
+                        # Fallback C: нет детей и siblings - это нормально, будет расширение до более широкого prefix
+                        logger.warning(f"List introducer {list_introducer_seed.anchor} has no children and no siblings - will try broader prefix")
+        
+        # Объединяем все результаты: complete + standard headers + expanded from list introducers + colon unknown type
+        all_final_results = (
+            list(complete_results) + 
+            standard_header_results + 
+            expanded_from_list_introducers + 
+            colon_unknown_type
+        )
+        
+        # Дедупликация по chunk_id (на случай если дочерний подпункт уже был в complete_results)
+        seen_chunk_ids = set()
+        deduped_results = []
+        for candidate in all_final_results:
+            if candidate.chunk_id not in seen_chunk_ids:
+                seen_chunk_ids.add(candidate.chunk_id)
+                deduped_results.append(candidate)
+        
+        # Сортируем по anchor (как раньше)
+        deduped_results.sort(key=lambda x: x.anchor or "")
+        
+        # Используем deduped_results для финального output
+        final_results = deduped_results
+        
+        logger.info(f"Финальных результатов (после фильтрации incomplete и expansion): {len(final_results)}")
+        if incomplete_warnings:
+            logger.warning(f"Incomplete seed warnings: {incomplete_warnings}")
         
         # Конвертируем в формат API (строго anchor + text_raw)
         results = []
         for candidate in final_results:
-            results.append({
+            result_dict = {
                 "chunk_id": candidate.chunk_id,
                 "anchor": candidate.anchor,
                 "text_raw": candidate.text_raw,
@@ -150,9 +616,149 @@ class CitationRetriever(BaseRetriever):
                     "final_score": candidate.final_score
                 },
                 "explanation": getattr(candidate, 'explanation', 'citation retrieval')
-            })
+            }
+            
+            # Добавляем флаги для expanded chunks
+            explanation = getattr(candidate, 'explanation', '')
+            if explanation:
+                if explanation.startswith('expanded_from_list_introducer:'):
+                    expanded_from_anchor = explanation.split(':', 1)[1]
+                    result_dict["flags"] = {"expanded_from": expanded_from_anchor, "type": "list_introducer_child"}
+                elif explanation.startswith('expanded_from_list_introducer_siblings:'):
+                    expanded_from_anchor = explanation.split(':', 1)[1]
+                    result_dict["flags"] = {"expanded_from": expanded_from_anchor, "type": "sibling"}
+                elif explanation == "list_introducer_header":
+                    result_dict["flags"] = {"type": "list_introducer_header"}
+            
+            results.append(result_dict)
+        
+        # Warnings логируются, но не возвращаются как error message
+        # Если results пустой - fallback на §164.512 уже обработан выше
+        if incomplete_warnings:
+            logger.info(f"Incomplete seed warnings (handled by fallback): {incomplete_warnings}")
         
         return results
+    
+    async def _fallback_to_section_164_512(
+        self,
+        doc_id: str,
+        question_embedding: List[float],
+        question: str,
+        k: int
+    ) -> List[CandidateChunk]:
+        """
+        Fallback: возвращает §164.512 целиком, если нет подпунктов.
+        
+        Сценарий A: В базе есть chunk с anchor §164.512 (section-level или atomic)
+        Сценарий B: В базе нет §164.512, но есть много §164.512(a), §164.512(b) и т.д.
+        
+        Args:
+            doc_id: ID документа
+            question_embedding: Эмбеддинг вопроса
+            question: Текст вопроса
+            k: Количество результатов
+        
+        Returns:
+            Список CandidateChunk с результатами по §164.512
+        """
+        logger.info("Attempting fallback to §164.512")
+        
+        with self.db.cursor() as cur:
+            # Сценарий A: Ищем section-level или atomic chunk с точным anchor §164.512
+            cur.execute("""
+                SELECT 
+                    c.chunk_id,
+                    c.anchor,
+                    c.section_id,
+                    c.section_number,
+                    c.section_title,
+                    c.text_raw,
+                    c.page_start,
+                    c.page_end,
+                    CASE 
+                        WHEN c.embedding IS NOT NULL THEN 1 - (c.embedding <=> %s::vector)
+                        ELSE 0.5
+                    END AS vector_score,
+                    0.0 AS fts_score,
+                    CASE 
+                        WHEN c.embedding IS NOT NULL THEN 1 - (c.embedding <=> %s::vector)
+                        ELSE 0.5
+                    END AS final_score
+                FROM chunks c
+                WHERE c.doc_id = %s
+                  AND c.anchor = '§164.512'
+                ORDER BY c.granularity = 'section' DESC, c.embedding <=> %s::vector NULLS LAST
+                LIMIT 1
+            """, (question_embedding, question_embedding, doc_id, question_embedding))
+            
+            row = cur.fetchone()
+            if row:
+                logger.info("Found section-level or atomic chunk with anchor §164.512")
+                return [CandidateChunk(
+                    chunk_id=row[0],
+                    anchor=row[1],
+                    section_id=row[2],
+                    section_number=row[3],
+                    section_title=row[4],
+                    text_raw=row[5],
+                    page_start=row[6],
+                    page_end=row[7],
+                    vector_score=row[8] or 0.5,
+                    fts_score=0.0,
+                    final_score=row[10] or 0.5
+                )]
+            
+            # Сценарий B: Агрегат из atomic chunks anchor LIKE '§164.512%'
+            logger.info("No exact §164.512 chunk found, retrieving aggregate from §164.512%")
+            cur.execute("""
+                SELECT 
+                    c.chunk_id,
+                    c.anchor,
+                    c.section_id,
+                    c.section_number,
+                    c.section_title,
+                    c.text_raw,
+                    c.page_start,
+                    c.page_end,
+                    CASE 
+                        WHEN c.embedding IS NOT NULL THEN 1 - (c.embedding <=> %s::vector)
+                        ELSE 0.5
+                    END AS vector_score,
+                    0.0 AS fts_score,
+                    CASE 
+                        WHEN c.embedding IS NOT NULL THEN 1 - (c.embedding <=> %s::vector)
+                        ELSE 0.5
+                    END AS final_score
+                FROM chunks c
+                WHERE c.doc_id = %s
+                  AND c.granularity = 'atomic'
+                  AND c.anchor LIKE '§164.512%'
+                ORDER BY c.anchor, c.embedding <=> %s::vector NULLS LAST
+                LIMIT %s
+            """, (question_embedding, question_embedding, doc_id, question_embedding, min(k * 2, 25)))
+            
+            rows = cur.fetchall()
+            if rows:
+                logger.info(f"Found {len(rows)} atomic chunks with anchor LIKE '§164.512%'")
+                candidates = []
+                for row in rows:
+                    candidates.append(CandidateChunk(
+                        chunk_id=row[0],
+                        anchor=row[1],
+                        section_id=row[2],
+                        section_number=row[3],
+                        section_title=row[4],
+                        text_raw=row[5],
+                        page_start=row[6],
+                        page_end=row[7],
+                        vector_score=row[8] or 0.5,
+                        fts_score=0.0,
+                        final_score=row[10] or 0.5
+                    ))
+                return candidates[:k]
+            
+            logger.warning("No chunks found for fallback to §164.512")
+            return []
     
     def infer_anchor_prefix(self, question: str) -> str:
         """
@@ -372,6 +978,76 @@ class CitationRetriever(BaseRetriever):
         
         return merged_list
     
+    async def _expand_incomplete_seed(
+        self,
+        seed_anchor: str,
+        doc_id: str,
+        limit: int = 8
+    ) -> List[CandidateChunk]:
+        """
+        Шаг 3: Coverage completion для incomplete seed.
+        
+        Ищет дочерние подпункты для incomplete seed (заголовка, заканчивающегося на ":").
+        Например, для §164.512(f)(1) ищет §164.512(f)(1)(i), §164.512(f)(1)(ii) и т.д.
+        
+        Args:
+            seed_anchor: Anchor incomplete seed (например, "§164.512(f)(1)")
+            doc_id: ID документа
+            limit: Максимальное количество дочерних подпунктов
+        
+        Returns:
+            Список дочерних подпунктов (CandidateChunk)
+        """
+        if not seed_anchor:
+            return []
+        
+        with self.db.cursor() as cur:
+            # Ищем дочерние подпункты: anchor LIKE seed_anchor || '%'
+            # Исключаем сам seed_anchor
+            anchor_like = f"{seed_anchor}%"
+            
+            query = """
+                SELECT 
+                    c.chunk_id,
+                    c.anchor,
+                    c.section_id,
+                    c.section_number,
+                    c.section_title,
+                    c.text_raw,
+                    c.page_start,
+                    c.page_end
+                FROM chunks c
+                WHERE c.doc_id = %s
+                  AND c.granularity = 'atomic'
+                  AND c.part = 164
+                  AND c.anchor LIKE %s
+                  AND c.anchor <> %s
+                ORDER BY c.anchor
+                LIMIT %s
+            """
+            
+            cur.execute(query, (doc_id, anchor_like, seed_anchor, limit))
+            
+            children = []
+            for row in cur.fetchall():
+                candidate = CandidateChunk(
+                    chunk_id=row[0],
+                    anchor=row[1],
+                    section_id=row[2],
+                    section_number=row[3],
+                    section_title=row[4],
+                    text_raw=row[5],
+                    page_start=row[6],
+                    page_end=row[7],
+                    vector_score=0.0,  # Дочерние подпункты не имеют vector_score (они подтягиваются структурно)
+                    fts_score=0.0,
+                    final_score=0.0
+                )
+                children.append(candidate)
+            
+            logger.info(f"Expanded incomplete seed {seed_anchor}: found {len(children)} child subparagraphs")
+            return children
+    
     async def _expand_coverage(
         self,
         seeds: List[CandidateChunk],
@@ -459,6 +1135,80 @@ class CitationRetriever(BaseRetriever):
                     break
             
             return expanded
+    
+    async def _get_sibling_chunks(
+        self,
+        seed: CandidateChunk,
+        doc_id: str,
+        anchor_like: Optional[str],
+        limit: int = 12
+    ) -> List[CandidateChunk]:
+        """
+        Шаг 4 Fallback B: Получает sibling chunks из той же секции.
+        
+        Если list introducer не имеет дочерних подпунктов, возвращает соседние чанки
+        из той же секции в пределах anchor_like.
+        
+        Args:
+            seed: Seed chunk (list introducer)
+            doc_id: ID документа
+            anchor_like: Anchor prefix для фильтрации (например, "§164.512(f)%")
+            limit: Максимальное количество sibling chunks
+        
+        Returns:
+            Список sibling chunks (CandidateChunk)
+        """
+        if not seed.section_id:
+            return []
+        
+        with self.db.cursor() as cur:
+            query = """
+                SELECT 
+                    c.chunk_id,
+                    c.anchor,
+                    c.section_id,
+                    c.section_number,
+                    c.section_title,
+                    c.text_raw,
+                    c.page_start,
+                    c.page_end
+                FROM chunks c
+                WHERE c.doc_id = %s
+                  AND c.granularity = 'atomic'
+                  AND c.section_id = %s
+                  AND c.chunk_id <> %s
+            """
+            params = [doc_id, seed.section_id, seed.chunk_id]
+            
+            # Дополнительно ограничиваем по scope: anchor LIKE anchor_like
+            if anchor_like:
+                query += " AND c.anchor LIKE %s"
+                params.append(anchor_like)
+            
+            query += " ORDER BY c.anchor LIMIT %s"
+            params.append(limit)
+            
+            cur.execute(query, params)
+            
+            siblings = []
+            for row in cur.fetchall():
+                candidate = CandidateChunk(
+                    chunk_id=row[0],
+                    anchor=row[1],
+                    section_id=row[2],
+                    section_number=row[3],
+                    section_title=row[4],
+                    text_raw=row[5],
+                    page_start=row[6],
+                    page_end=row[7],
+                    vector_score=0.0,
+                    fts_score=0.0,
+                    final_score=0.0
+                )
+                siblings.append(candidate)
+            
+            logger.info(f"Found {len(siblings)} sibling chunks for seed {seed.anchor} in section {seed.section_id}")
+            return siblings
     
     def _are_anchors_nearby(self, anchor1: str, anchor2: str) -> bool:
         """

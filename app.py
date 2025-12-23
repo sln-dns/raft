@@ -231,13 +231,25 @@ async def search_chunks(request: QuestionRequest):
                 ))
             else:
                 # Обычный ретривер
+                # Проверяем, что обязательные поля не пустые (для error messages от CitationRetriever)
+                chunk_id = chunk.get("chunk_id") or ""
+                section_number = chunk.get("section_number") or ""
+                section_title = chunk.get("section_title") or ""
+                
+                # Если это error message (chunk_id пустой, но есть text_raw с ошибкой), пропускаем создание RetrievedChunk
+                if not chunk_id and chunk.get("explanation") == "no_results_after_expansion":
+                    # Это error message от CitationRetriever - не создаем RetrievedChunk, но логируем
+                    logger.warning(f"CitationRetriever returned error message: {chunk.get('text_raw', 'Unknown error')}")
+                    # Продолжаем без добавления в retrieved_chunks
+                    continue
+                
                 retrieved_chunks.append(RetrievedChunk(
-                    chunk_id=chunk["chunk_id"],
-                    section_number=chunk["section_number"],
-                    section_title=chunk["section_title"],
+                    chunk_id=chunk_id,
+                    section_number=section_number,
+                    section_title=section_title,
                     text_raw=chunk["text_raw"],
                     similarity=chunk["scores"]["final_score"],
-                    anchor=chunk.get("anchor"),
+                    anchor=chunk.get("anchor") or "",
                     chunk_kind=chunk.get("chunk_kind")
                 ))
         
@@ -339,13 +351,25 @@ async def generate_answer(request: QuestionRequest):
                 ))
             else:
                 # Обычный ретривер
+                # Проверяем, что обязательные поля не пустые (для error messages от CitationRetriever)
+                chunk_id = chunk.get("chunk_id") or ""
+                section_number = chunk.get("section_number") or ""
+                section_title = chunk.get("section_title") or ""
+                
+                # Если это error message (chunk_id пустой, но есть text_raw с ошибкой), пропускаем создание RetrievedChunk
+                if not chunk_id and chunk.get("explanation") == "no_results_after_expansion":
+                    # Это error message от CitationRetriever - не создаем RetrievedChunk, но логируем
+                    logger.warning(f"CitationRetriever returned error message: {chunk.get('text_raw', 'Unknown error')}")
+                    # Продолжаем без добавления в retrieved_chunks
+                    continue
+                
                 retrieved_chunks.append(RetrievedChunk(
-                    chunk_id=chunk["chunk_id"],
-                    section_number=chunk["section_number"],
-                    section_title=chunk["section_title"],
+                    chunk_id=chunk_id,
+                    section_number=section_number,
+                    section_title=section_title,
                     text_raw=chunk["text_raw"],
                     similarity=chunk["scores"]["final_score"],
-                    anchor=chunk.get("anchor"),
+                    anchor=chunk.get("anchor") or "",
                     chunk_kind=chunk.get("chunk_kind")
                 ))
         

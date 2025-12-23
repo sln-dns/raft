@@ -58,6 +58,12 @@ CITE_WORDS = [
 
 # Шаг 3.3: Строгие темы для определения anchor_hint и scope_hint
 STRICT_TOPICS = {
+    "law_enforcement_permitted": {
+        "anchor_hint": "§164.512(f)(1)",
+        "scope_hint": "law_enforcement_permitted",
+        "required_keywords": ["law enforcement"],  # Обязательное условие
+        "optional_keywords": ["permitted disclosures", "on what basis", "pursuant to process", "pursuant to what process"]  # Хотя бы одно из
+    },
     "law enforcement": {
         "anchor_hint": "§164.512(f)",
         "scope_hint": "law enforcement",
@@ -162,12 +168,22 @@ def _detect_router_signals(question: str) -> Tuple[Optional[str], bool, Optional
     anchor_hint = None
     scope_hint = None
     
+    # Шаг 5: Проверяем law_enforcement_permitted -> §164.512(f)(1) (приоритет над обычным law enforcement)
+    if "law enforcement" in question_lower:
+        # Проверяем, есть ли также "permitted disclosures" или "on what basis" или "pursuant to process"
+        optional_keywords = STRICT_TOPICS["law_enforcement_permitted"]["optional_keywords"]
+        if any(opt_keyword in question_lower for opt_keyword in optional_keywords):
+            anchor_hint = STRICT_TOPICS["law_enforcement_permitted"]["anchor_hint"]
+            scope_hint = STRICT_TOPICS["law_enforcement_permitted"]["scope_hint"]
+            logger.info(f"Router signal: strict_topic='law_enforcement_permitted', anchor_hint='{anchor_hint}', scope_hint='{scope_hint}'")
+    
     # Проверяем victim + crime/suspected victim -> §164.512(f)(3)
-    if "victim" in question_lower:
-        if "crime" in question_lower or "suspected victim" in question_lower:
-            anchor_hint = STRICT_TOPICS["victim"]["anchor_hint"]
-            scope_hint = STRICT_TOPICS["victim"]["scope_hint"]
-            logger.info(f"Router signal: strict_topic='victim', anchor_hint='{anchor_hint}', scope_hint='{scope_hint}'")
+    if not anchor_hint:  # Только если еще не определили
+        if "victim" in question_lower:
+            if "crime" in question_lower or "suspected victim" in question_lower:
+                anchor_hint = STRICT_TOPICS["victim"]["anchor_hint"]
+                scope_hint = STRICT_TOPICS["victim"]["scope_hint"]
+                logger.info(f"Router signal: strict_topic='victim', anchor_hint='{anchor_hint}', scope_hint='{scope_hint}'")
     
     # Проверяем suspect/fugitive/witness/missing person -> §164.512(f)(2)
     if not anchor_hint:  # Только если еще не определили
@@ -178,7 +194,7 @@ def _detect_router_signals(question: str) -> Tuple[Optional[str], bool, Optional
                 logger.info(f"Router signal: strict_topic='suspect_fugitive', anchor_hint='{anchor_hint}', scope_hint='{scope_hint}'")
                 break
     
-    # Проверяем law enforcement -> §164.512(f)
+    # Проверяем law enforcement -> §164.512(f) (fallback, если не law_enforcement_permitted)
     if not anchor_hint:  # Только если еще не определили
         for keyword in STRICT_TOPICS["law enforcement"]["keywords"]:
             if keyword in question_lower:
