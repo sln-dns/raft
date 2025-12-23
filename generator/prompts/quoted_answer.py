@@ -49,12 +49,12 @@ def build_prompt(
             # Сигнал от ретривера - это подсказка, но LLM должен опираться на контекст
             rationale_text = f" (Retriever signal: {yesno_rationale})" if yesno_rationale else ""
             yesno_instruction = (
-                f"\n6. Retriever signal: {yesno_signal.upper()}{rationale_text}. "
+                f"\n8. Retriever signal: {yesno_signal.upper()}{rationale_text}. "
                 f"Start your answer with: {yesno_signal.upper()} / NO / UNCLEAR "
-                f"based on the evidence in the provided context (the signal is a hint, verify with context)."
+                f"(the signal is a hint, verify with the excerpts above)."
             )
         else:
-            yesno_instruction = "\n6. Start your answer with: YES / NO / UNCLEAR (based on the evidence in context)"
+            yesno_instruction = "\n8. Start your answer with: YES / NO / UNCLEAR (verify with the excerpts above)"
     
     # Special handling for regulatory_principle questions
     if is_regulatory_principle:
@@ -93,8 +93,8 @@ def build_prompt(
         )
     
     system = """You are an expert on HIPAA regulations.
-Answer questions using exact quotes from the provided regulatory context.
-Use only provided context. If insufficient, say insufficient context.
+Answer using ONLY the regulatory excerpts below.
+Do not add preambles. Do not mention the excerpts/context.
 You MUST return your answer in JSON format."""
     
     # Build list of available anchors for validation
@@ -111,9 +111,15 @@ User question: {question}
 
 Available anchors (you can ONLY use these): {anchors_list}
 
+HOUSE STYLE - CRITICAL:
+- Do NOT say phrases like: "Based on the provided context", "According to the provided context", "From the context", "The context states", "The provided regulatory context".
+- Do NOT mention that you were given context or that you are an AI.
+- Start directly with the answer. Use plain declarative sentences.
+- Use anchors/quotes as evidence, not as meta commentary.
+
 Instructions:
-1. Provide a brief answer (1-2 sentences) explaining the concept or answering the question
-2. Include 1-3 exact quotes from the context with their anchors (you may use quotes from different sections/anchors)
+1. Answer in 1-2 sentences. The first sentence must be the conclusion.
+2. Then provide 1-3 exact quotes with anchors (you may use quotes from different sections/anchors)
 3. You MUST return your response as JSON with this structure:
 {{
   "answer": "your brief answer text",
@@ -124,9 +130,11 @@ Instructions:
 }}
 4. Use ONLY anchors from the available anchors list above
 5. Quotes must be exact substrings from the corresponding context items
+6. The "answer" field MUST NOT contain meta phrases (context/disclaimer). It must contain only the user-facing answer.
+7. If insufficient, return "answer": "Insufficient context." (without explanations why).
 {yesno_instruction}
 {regulatory_principle_instruction}
-6. IMPORTANT: Only use "insufficient context" if the provided context is completely irrelevant to the question. 
+9. IMPORTANT: Only use "insufficient context" if the provided context is completely irrelevant to the question. 
    For regulatory_principle questions, "not formally defined" is a VALID answer - do NOT use "insufficient context".
 
 Return ONLY valid JSON, no additional text:"""

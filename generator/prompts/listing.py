@@ -50,8 +50,8 @@ def build_prompt(
         permission_instruction = f"\n6. Policy signal: {permission_policy.upper()} - reflect this in your answer"
     
     system = """You are an expert on HIPAA regulations.
-Answer questions by providing structured lists based on the provided regulatory context.
-Use only provided context. If insufficient, say insufficient context.
+Answer using ONLY the regulatory excerpts below.
+Do not add preambles. Do not mention the excerpts/context.
 You MUST return your answer in JSON format."""
     
     # Build list of available anchors for validation
@@ -68,8 +68,14 @@ User question: {question}
 
 Available anchors (you can ONLY use these): {anchors_list}
 
+HOUSE STYLE - CRITICAL:
+- Do NOT say phrases like: "Based on the provided context", "According to the provided context", "From the context", "The context states", "The provided regulatory context".
+- Do NOT mention that you were given context or that you are an AI.
+- Start directly with the answer. Use plain declarative sentences.
+- Use anchors/quotes as evidence, not as meta commentary.
+
 Instructions:
-1. Provide a structured list of items/conditions/requirements
+1. Return a list only (no introduction).
 2. Each item must include its anchor
 3. You MUST return your response as JSON with this structure:
 {{
@@ -81,7 +87,8 @@ Instructions:
 }}
 4. Use ONLY anchors from the available anchors list above
 5. Quotes must be exact substrings from the corresponding context items
-6. If information is not found in the context, set answer to "insufficient context" and citations to []
+6. The "answer" field MUST NOT contain meta phrases (context/disclaimer). It must contain only the user-facing answer.
+7. If insufficient, return "answer": "Insufficient context." and "citations": [] (without explanations why).
 {permission_instruction}
 
 Return ONLY valid JSON, no additional text:"""
