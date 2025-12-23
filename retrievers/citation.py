@@ -76,11 +76,11 @@ class CitationRetriever(BaseRetriever):
         
         # Step 0: Зафиксировать "юрисдикцию" (scope)
         if not anchor_prefix:
-            anchor_prefix = self._determine_anchor_prefix(question)
+            anchor_prefix = self.infer_anchor_prefix(question)
         
         anchor_like = f"{anchor_prefix}%" if anchor_prefix else None
         
-        logger.info(f"CitationRetriever (from new module): question='{question[:50]}...', anchor_prefix={anchor_prefix}, k={k}")
+        logger.info(f"CitationRetriever (from new module): question='{question[:50]}...', anchor_prefix={anchor_prefix}, anchor_like={anchor_like}, k={k}")
         
         # Step 1: Candidate retrieval: vector search по atomic + hard filter по anchor prefix
         vector_candidates = await self._vector_search_citation(
@@ -154,24 +154,67 @@ class CitationRetriever(BaseRetriever):
         
         return results
     
-    def _determine_anchor_prefix(self, question: str) -> str:
+    def infer_anchor_prefix(self, question: str) -> str:
         """
-        Определяет anchor prefix по вопросу.
+        Определяет точный anchor prefix по вопросу (scope parsing для подпунктов).
+        
+        Шаг 2.1: Более точное определение prefix для law enforcement:
+        - Если встречается law enforcement -> §164.512(f)
+        - Если встречается suspect/fugitive/material witness/missing person/identify or locate -> §164.512(f)(2)
+        - Если встречается victim и (crime или suspected victim) -> §164.512(f)(3)
+        - Если в вопросе явно есть строка вида §164.512(f) - уважать её
+        - Иначе fallback: §164.512
+        
+        Args:
+            question: Текст вопроса
         
         Returns:
-            anchor prefix (например, "§164.512")
+            anchor prefix (например, "§164.512(f)" или "§164.512")
         """
         if not question:
-            return "§164.512"  # Дефолт для law enforcement
+            return "§164.512"  # Дефолт
         
         question_lower = question.lower()
         
-        # Проверяем известные темы
+        # Шаг 2.1.4: Проверяем явное указание anchor в вопросе (самый сильный сигнал)
+        # Паттерн должен захватывать §164.512(f), §164.512(f)(2), §164.512(f)(3) и т.д.
+        explicit_anchor_match = re.search(r'§\s*164\.512\s*(?:\([a-z0-9]+\)(?:\([0-9]+\))?)+', question, re.IGNORECASE)
+        if explicit_anchor_match:
+            anchor_found = explicit_anchor_match.group(0)
+            # Нормализуем (убираем пробелы после § и между скобками)
+            anchor_found = re.sub(r'§\s+', '§', anchor_found)
+            anchor_found = re.sub(r'\s+', '', anchor_found)  # Убираем все пробелы
+            logger.info(f"Found explicit anchor in question: {anchor_found}")
+            return anchor_found
+        
+        # Шаг 2.1.3: Проверяем victim + crime/suspected victim -> §164.512(f)(3)
+        if "victim" in question_lower:
+            if "crime" in question_lower or "suspected victim" in question_lower:
+                logger.info("Inferred anchor prefix: §164.512(f)(3) (victim + crime)")
+                return "§164.512(f)(3)"
+        
+        # Шаг 2.1.2: Проверяем suspect/fugitive/material witness/missing person/identify or locate -> §164.512(f)(2)
+        f2_keywords = [
+            "suspect", "fugitive", "material witness", "missing person",
+            "identify or locate", "identify", "locate"
+        ]
+        if any(keyword in question_lower for keyword in f2_keywords):
+            logger.info("Inferred anchor prefix: §164.512(f)(2) (suspect/fugitive/witness/missing person)")
+            return "§164.512(f)(2)"
+        
+        # Шаг 2.1.1: Проверяем law enforcement -> §164.512(f)
+        if "law enforcement" in question_lower:
+            logger.info("Inferred anchor prefix: §164.512(f) (law enforcement)")
+            return "§164.512(f)"
+        
+        # Fallback: проверяем известные темы из старого маппинга
         for topic, prefix in self.TOPIC_ANCHOR_PREFIXES.items():
             if topic in question_lower:
+                logger.info(f"Inferred anchor prefix: {prefix} (topic: {topic})")
                 return prefix
         
         # Дефолт для law enforcement (наиболее частый кейс)
+        logger.info("Using default anchor prefix: §164.512")
         return "§164.512"
     
     async def _vector_search_citation(
@@ -395,12 +438,16 @@ class CitationRetriever(BaseRetriever):
                 )
                 all_chunks.append(candidate)
             
-            # Берем ближайших соседей к seeds (по порядку anchor)
+            # Шаг 2.4: Берем ближайших соседей к seeds (по порядку anchor), но только внутри prefix
             expanded = []
             seed_anchors = [s.anchor for s in seeds if s.anchor]
             
             for candidate in all_chunks:
                 if candidate.anchor:
+                    # Шаг 2.4: Фильтруем только те, что начинаются с prefix (дополнительная проверка)
+                    if not candidate.anchor.startswith(prefix):
+                        continue
+                    
                     # Проверяем, является ли этот chunk соседом какого-либо seed
                     for seed_anchor in seed_anchors:
                         # Простая эвристика: если anchor близок по алфавиту/порядку

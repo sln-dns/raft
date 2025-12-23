@@ -26,6 +26,33 @@ def normalize_whitespace(text: str) -> str:
     return text.strip()
 
 
+def normalize_anchor(anchor: str) -> str:
+    """
+    Нормализует anchor для более мягкого сравнения.
+    
+    Правила нормализации:
+    - Убирает пробелы после § (например, "§ 164.512" -> "§164.512")
+    - Нормализует пробелы (множественные -> один)
+    - Приводит к единому виду Unicode section sign (если нужно)
+    
+    Args:
+        anchor: Исходный anchor
+    
+    Returns:
+        Нормализованный anchor
+    """
+    if not anchor:
+        return ""
+    
+    # Убираем пробелы после §
+    anchor = re.sub(r'§\s+', '§', anchor)
+    
+    # Нормализуем пробелы
+    anchor = normalize_whitespace(anchor)
+    
+    return anchor
+
+
 def extract_relevant_quote(text_raw: str, max_length: int = 300) -> str:
     """
     Извлекает релевантный фрагмент из text_raw для использования как quote.
@@ -208,7 +235,8 @@ def parse_and_validate_citations(
     llm_response: str,
     context_items: List[ContextItem],
     require_citations: bool = False,
-    auto_fix_quote: bool = True
+    auto_fix_quote: bool = True,
+    evidence_exists: bool = False
 ) -> tuple[str, List[Citation]]:
     """
     Парсит JSON ответ от LLM и валидирует citations.
@@ -216,11 +244,15 @@ def parse_and_validate_citations(
     Если anchor валиден, но quote не найден, автоматически исправляет quote
     (если auto_fix_quote=True), используя релевантный фрагмент из text_raw.
     
+    Шаг 3.2: Если evidence_exists=True и нет валидных citations, автоматически собирает
+    citations из top context items с anchors.
+    
     Args:
         llm_response: Ответ от LLM (должен быть JSON)
         context_items: Элементы контекста для валидации
         require_citations: Если True и нет валидных citations - возвращает ошибку
         auto_fix_quote: Если True, автоматически исправляет quote при валидном anchor
+        evidence_exists: Если True, запрещает "Insufficient context" и автоматически собирает citations
     
     Returns:
         Tuple (answer_text, valid_citations)
@@ -275,8 +307,69 @@ def parse_and_validate_citations(
                 f"Invalid citation filtered out (anchor not in context or quote validation failed): {citation_data}"
             )
     
-    # Если citations обязательны и их нет - возвращаем ошибку
+    # Шаг 3.2: Если citations обязательны и их нет, но evidence_exists=True - автоматически собираем citations
     if require_citations and not valid_citations:
+        # ИСКЛЮЧЕНИЕ 1: для regulatory_principle, если answer содержит "does not provide a standalone definition",
+        # это валидный ответ даже без citations (но citations желательны)
+        is_regulatory_principle_response = (
+            "does not provide a standalone definition" in answer_text.lower() or
+            "not formally defined" in answer_text.lower() or
+            "not provide a standalone definition" in answer_text.lower()
+        )
+        
+        if is_regulatory_principle_response:
+            # Для regulatory_principle "not formally defined" - это валидный ответ
+            # Но все равно логируем предупреждение, что citations не были предоставлены
+            logger.warning("Required citations not found for regulatory_principle, but 'not formally defined' response is valid")
+            # Возвращаем ответ как есть, но без citations
+            return answer_text, []
+        
+        # ИСКЛЮЧЕНИЕ 2: если evidence_exists=True, запрещаем "Insufficient context" и автоматически собираем citations
+        if evidence_exists:
+            logger.warning("Required citations not found, but evidence_exists=True - auto-generating citations from context")
+            
+            # Автоматически собираем citations из top-1..top-2 context items с anchors
+            auto_citations = []
+            items_with_anchors = [item for item in context_items if item.anchor and item.text_raw]
+            
+            # Берем top-2 items с anchors
+            for item in items_with_anchors[:2]:
+                quote = extract_relevant_quote(item.text_raw, max_length=300)
+                if quote:
+                    auto_citations.append(Citation(
+                        anchor=item.anchor,
+                        quote=quote,
+                        chunk_id=item.chunk_id
+                    ))
+            
+            if auto_citations:
+                logger.info(f"Auto-generated {len(auto_citations)} citations from context items")
+                # Если есть LLM answer, используем его, иначе генерируем короткий template
+                if answer_text and answer_text.lower() not in ("insufficient context", "insufficient context to provide exact citation."):
+                    # Используем LLM answer
+                    return answer_text, auto_citations
+                else:
+                    # Генерируем короткий template на английском
+                    anchors_str = ", ".join([c.anchor for c in auto_citations])
+                    answer_text = f"Relevant provision(s): {anchors_str}"
+                    return answer_text, auto_citations
+            else:
+                # Если не удалось собрать citations, все равно возвращаем ответ (если есть)
+                if answer_text and answer_text.lower() not in ("insufficient context", "insufficient context to provide exact citation."):
+                    return answer_text, []
+                else:
+                    # Последний fallback - используем первый context item
+                    if items_with_anchors:
+                        first_item = items_with_anchors[0]
+                        quote = extract_relevant_quote(first_item.text_raw, max_length=300)
+                        if quote:
+                            return f"Relevant provision: {first_item.anchor}", [Citation(
+                                anchor=first_item.anchor,
+                                quote=quote,
+                                chunk_id=first_item.chunk_id
+                            )]
+        
+        # Если не подошли исключения - возвращаем ошибку
         logger.warning("Required citations not found or invalid after validation")
         return "Insufficient context to provide exact citation.", []
     

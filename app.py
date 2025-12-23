@@ -58,6 +58,10 @@ class ClassificationResponse(BaseModel):
     category: str
     confidence: float
     reasoning: str
+    require_citations: bool = False
+    citation_mode: str = "none"  # "none", "quoted", "strict"
+    anchor_hint: Optional[str] = None
+    scope_hint: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
@@ -131,12 +135,16 @@ async def classify_question(request: QuestionRequest):
         
         # Применение post-classification override
         from classification_override import apply_classification_override
-        classification = apply_classification_override(classification, request.question)
+        classification, concept_term = apply_classification_override(classification, request.question)
         
         result = ClassificationResponse(
             category=classification.category,
             confidence=classification.confidence,
-            reasoning=classification.reasoning
+            reasoning=classification.reasoning,
+            require_citations=classification.require_citations,
+            citation_mode=classification.citation_mode,
+            anchor_hint=classification.anchor_hint,
+            scope_hint=classification.scope_hint
         )
         
         logger.info(f"Категория: {result.category} (уверенность: {result.confidence:.2%})")
@@ -158,23 +166,52 @@ async def search_chunks(request: QuestionRequest):
         logger.info(f"Поиск чанков для вопроса: {request.question[:100]}...")
         
         # 1. Классификация вопроса
-        classification = classifier.classify(request.question)
-        logger.info(f"Категория: {classification.category}")
+        initial_classification = classifier.classify(request.question)
+        original_category = initial_classification.category
+        logger.info(f"Категория (before override): {original_category}")
+        
+        # 1.1. Применение post-classification override (доменные правила)
+        from classification_override import apply_classification_override
+        classification, _ = apply_classification_override(initial_classification, request.question)
+        if classification.category != original_category:
+            logger.info(f"Classification override: original_category='{original_category}' -> overridden_category='{classification.category}'")
         
         # 2. Создание эмбеддинга для вопроса
         question_embedding = embedding_client.create_embedding(request.question)
         logger.info(f"Эмбеддинг создан (размерность: {len(question_embedding)})")
         
-        # 3. Поиск в базе данных с использованием ретривера
-        retriever = get_retriever_for_category(
-            classification.category,
-            question=request.question
-        )
-        retrieved_chunks_raw = await retriever.retrieve(
-            question_embedding=question_embedding,
-            max_results=request.max_results,
-            question=request.question
-        )
+        # 3. Выбор ретривера на основе citation_mode или category
+        # Если citation_mode=="strict" -> выбираем CitationRetriever (даже если category не citation-required)
+        if classification.citation_mode == "strict":
+            logger.info(
+                f"Retriever selection: citation_mode='strict' -> CitationRetriever "
+                f"(category='{classification.category}', anchor_hint='{classification.anchor_hint}', scope_hint='{classification.scope_hint}')"
+            )
+            from retrievers.citation import CitationRetriever
+            retriever = CitationRetriever()
+            # Передаем anchor_hint в CitationRetriever как anchor_prefix
+            anchor_prefix = classification.anchor_hint if classification.anchor_hint else None
+            retrieved_chunks_raw = await retriever.retrieve(
+                question_embedding=question_embedding,
+                max_results=request.max_results,
+                question=request.question,
+                anchor_prefix=anchor_prefix  # Передаем anchor_hint как anchor_prefix
+            )
+        else:
+            # Иначе выбираем ретривер по category как раньше
+            logger.info(
+                f"Retriever selection: category='{classification.category}' -> {get_retriever_for_category.__name__} "
+                f"(citation_mode='{classification.citation_mode}', require_citations={classification.require_citations})"
+            )
+            retriever = get_retriever_for_category(
+                classification.category,
+                question=request.question
+            )
+            retrieved_chunks_raw = await retriever.retrieve(
+                question_embedding=question_embedding,
+                max_results=request.max_results,
+                question=request.question
+            )
         
         # Конвертируем в формат API
         # NavigationRetriever возвращает другую структуру (section_id вместо chunk_id, нет text_raw)
@@ -211,7 +248,11 @@ async def search_chunks(request: QuestionRequest):
             classification=ClassificationResponse(
                 category=classification.category,
                 confidence=classification.confidence,
-                reasoning=classification.reasoning
+                reasoning=classification.reasoning,
+                require_citations=classification.require_citations,
+                citation_mode=classification.citation_mode,
+                anchor_hint=classification.anchor_hint,
+                scope_hint=classification.scope_hint
             ),
             retrieved_chunks=retrieved_chunks,
             total_found=len(retrieved_chunks)
@@ -234,28 +275,51 @@ async def generate_answer(request: QuestionRequest):
         
         # 1. Классификация вопроса
         initial_classification = classifier.classify(request.question)
-        logger.info(f"Категория (before override): {initial_classification.category}")
+        original_category = initial_classification.category
+        logger.info(f"Категория (before override): {original_category}")
         
         # 1.1. Применение post-classification override (доменные правила)
         from classification_override import apply_classification_override
-        classification = apply_classification_override(initial_classification, request.question)
-        if classification.category != initial_classification.category:
-            logger.info(f"Категория (after override): {classification.category} (was: {initial_classification.category})")
+        classification, concept_term = apply_classification_override(initial_classification, request.question)
+        if classification.category != original_category:
+            logger.info(f"Classification override: original_category='{original_category}' -> overridden_category='{classification.category}'")
         
         # 2. Создание эмбеддинга для вопроса
         question_embedding = embedding_client.create_embedding(request.question)
         
-        # 3. Поиск релевантных чанков с использованием ретривера
-        retriever = get_retriever_for_category(
-            classification.category,
-            question=request.question
-        )
-        retrieved_chunks_raw = await retriever.retrieve(
-            question_embedding=question_embedding,
-            max_results=request.max_results,
-            question=request.question,
-            category=classification.category  # Передаем категорию для поддержки regulatory_principle
-        )
+        # 3. Выбор ретривера на основе citation_mode или category
+        # Если citation_mode=="strict" -> выбираем CitationRetriever (даже если category не citation-required)
+        if classification.citation_mode == "strict":
+            logger.info(
+                f"Retriever selection: citation_mode='strict' -> CitationRetriever "
+                f"(category='{classification.category}', anchor_hint='{classification.anchor_hint}', scope_hint='{classification.scope_hint}')"
+            )
+            from retrievers.citation import CitationRetriever
+            retriever = CitationRetriever()
+            # Передаем anchor_hint в CitationRetriever как anchor_prefix
+            anchor_prefix = classification.anchor_hint if classification.anchor_hint else None
+            retrieved_chunks_raw = await retriever.retrieve(
+                question_embedding=question_embedding,
+                max_results=request.max_results,
+                question=request.question,
+                anchor_prefix=anchor_prefix  # Передаем anchor_hint как anchor_prefix
+            )
+        else:
+            # Иначе выбираем ретривер по category как раньше
+            logger.info(
+                f"Retriever selection: category='{classification.category}' -> {get_retriever_for_category.__name__} "
+                f"(citation_mode='{classification.citation_mode}', require_citations={classification.require_citations})"
+            )
+            retriever = get_retriever_for_category(
+                classification.category,
+                question=request.question
+            )
+            retrieved_chunks_raw = await retriever.retrieve(
+                question_embedding=question_embedding,
+                max_results=request.max_results,
+                question=request.question,
+                category=classification.category  # Передаем категорию для поддержки regulatory_principle
+            )
         
         # Конвертируем в формат API
         # NavigationRetriever возвращает другую структуру (section_id вместо chunk_id, нет text_raw)
@@ -289,6 +353,11 @@ async def generate_answer(request: QuestionRequest):
         
         # Извлекаем сигналы из результатов ретривера
         retriever_signals = {}
+        
+        # Для regulatory_principle: добавляем concept_term из override
+        if classification.category == "regulatory_principle" and concept_term:
+            retriever_signals["concept_term"] = concept_term
+            logger.info(f"Retriever concept_term: {concept_term}")
         
         # Для procedural: yesno_signal и yesno_rationale из первого элемента
         if classification.category == "procedural / best practices" and retrieved_chunks_raw:
@@ -356,14 +425,30 @@ async def generate_answer(request: QuestionRequest):
         # Формируем debug информацию (опционально)
         debug_info = None
         if generation_result.meta:
-            debug_info = generation_result.meta
+            debug_info = generation_result.meta.copy()
+        
+        # Добавляем intent поля в debug
+        if debug_info is None:
+            debug_info = {}
+        debug_info.update({
+            "category": classification.category,
+            "citation_mode": classification.citation_mode,
+            "require_citations": classification.require_citations,
+            "anchor_hint": classification.anchor_hint,
+            "scope_hint": classification.scope_hint,
+            "retriever_type": retriever.__class__.__name__ if retriever else None
+        })
         
         return AnswerResponse(
             question=request.question,
             classification=ClassificationResponse(
                 category=classification.category,
                 confidence=classification.confidence,
-                reasoning=classification.reasoning
+                reasoning=classification.reasoning,
+                require_citations=classification.require_citations,
+                citation_mode=classification.citation_mode,
+                anchor_hint=classification.anchor_hint,
+                scope_hint=classification.scope_hint
             ),
             retrieved_chunks=retrieved_chunks,
             answer=generation_result.answer_text,  # Используем answer_text напрямую

@@ -107,7 +107,19 @@ class ProceduralRetriever(BaseRetriever):
         
         # Step 1: Подготовка FTS query (усиление)
         fts_query = build_fts_query(question, self.SECURITY_BOOST_WORDS, topic_tokens)
-        logger.info(f"FTS query (усиленный): {fts_query[:100]}...")
+        
+        # Дополнительное усиление FTS для regulatory_principle (minimum necessary)
+        if category == "regulatory_principle" and topic == "minimum_necessary":
+            # Добавляем специфичные фразы для minimum necessary
+            minimum_necessary_phrases = [
+                "minimum necessary",
+                "reasonable efforts",
+                "intended purpose"
+            ]
+            fts_query = f"{fts_query} {' '.join(minimum_necessary_phrases)}"
+            logger.info(f"FTS query усилен для minimum_necessary: {fts_query[:150]}...")
+        else:
+            logger.info(f"FTS query (усиленный): {fts_query[:100]}...")
         
         # Step 2: Candidate retrieval (hybrid) по atomic chunks
         candidates = await self._get_candidates(
@@ -137,7 +149,7 @@ class ProceduralRetriever(BaseRetriever):
         for candidate in candidates:
             candidate.keyword_score = calculate_keyword_score_procedural(candidate.text_raw, topic_tokens)
         
-        # Step 3.5: Soft boost для regulatory principles (если категория regulatory_principle)
+        # Step 3.5: Hard boost для regulatory principles (если категория regulatory_principle)
         if category == "regulatory_principle" and topic in self.REGULATORY_PRINCIPLE_BOOST_ANCHORS:
             boost_anchors = self.REGULATORY_PRINCIPLE_BOOST_ANCHORS[topic]
             for candidate in candidates:
@@ -145,9 +157,9 @@ class ProceduralRetriever(BaseRetriever):
                     # Проверяем, начинается ли anchor с boost anchor prefix
                     for boost_anchor in boost_anchors:
                         if candidate.anchor.startswith(boost_anchor):
-                            # Soft boost: увеличиваем final_score на 10%
-                            candidate.anchor_boost = 1.1
-                            logger.debug(f"Applied boost to anchor {candidate.anchor} for topic {topic}")
+                            # Hard boost: увеличиваем final_score на 20% (1.2x)
+                            candidate.anchor_boost = 1.2
+                            logger.info(f"Applied hard boost (1.2x) to anchor {candidate.anchor} for topic {topic}")
                             break
         
         # Step 4: Merge + final scoring
@@ -423,19 +435,59 @@ class ProceduralRetriever(BaseRetriever):
         
         return list(merged_dict.values())
     
-    def _select_seeds(self, candidates: List[CandidateChunk], seed_k: int) -> List[CandidateChunk]:
+    def _select_seeds(
+        self, 
+        candidates: List[CandidateChunk], 
+        seed_k: int,
+        category: Optional[str] = None,
+        topic: Optional[str] = None,
+        boost_anchors: Optional[List[str]] = None
+    ) -> List[CandidateChunk]:
         """
         Выбирает seed_k лучших seeds с дедупом по section_id.
+        
+        Для regulatory_principle с minimum_necessary: гарантирует минимум 1 seed из boost anchors.
         """
         seen_sections = set()
         selected = []
+        boost_anchor_selected = False
         
+        # Сначала пытаемся выбрать обычным способом
         for candidate in candidates:
             if candidate.section_id not in seen_sections:
+                # Проверяем, является ли это boost anchor (для regulatory_principle)
+                if category == "regulatory_principle" and boost_anchors and candidate.anchor:
+                    for boost_anchor in boost_anchors:
+                        if candidate.anchor.startswith(boost_anchor):
+                            boost_anchor_selected = True
+                            logger.info(f"Selected boost anchor seed: {candidate.anchor}")
+                            break
+                
                 selected.append(candidate)
                 seen_sections.add(candidate.section_id)
                 if len(selected) >= seed_k:
                     break
+        
+        # Если не нашли boost anchor в топ-N, принудительно добавляем первый найденный
+        if category == "regulatory_principle" and boost_anchors and not boost_anchor_selected:
+            logger.warning(f"No boost anchor found in top candidates, forcing selection from boost anchors")
+            for candidate in candidates:
+                if candidate.anchor:
+                    for boost_anchor in boost_anchors:
+                        if candidate.anchor.startswith(boost_anchor):
+                            # Проверяем, что еще не добавлен
+                            if candidate.chunk_id not in {s.chunk_id for s in selected}:
+                                # Вставляем в начало списка (приоритет)
+                                selected.insert(0, candidate)
+                                seen_sections.add(candidate.section_id)
+                                boost_anchor_selected = True
+                                logger.info(f"Force-selected boost anchor seed: {candidate.anchor}")
+                                # Ограничиваем до seed_k
+                                if len(selected) > seed_k:
+                                    selected = selected[:seed_k]
+                                break
+                    if boost_anchor_selected:
+                        break
         
         return selected
     

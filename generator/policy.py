@@ -66,7 +66,8 @@ def choose_policy(
     category: str,
     classification_confidence: float,
     signals: Optional[Dict[str, Any]] = None,
-    question: Optional[str] = None
+    question: Optional[str] = None,
+    citation_mode: Optional[str] = None
 ) -> AnswerPolicy:
     """
     Выбирает политику генерации ответа на основе категории, уверенности и сигналов.
@@ -76,11 +77,17 @@ def choose_policy(
         classification_confidence: Уверенность классификации (0.0-1.0)
         signals: Сигналы от ретривера (policy_signal, yesno_signal и т.д.)
         question: Текст вопроса (для определения навигационных вопросов)
+        citation_mode: Режим цитирования из classification ("none", "quoted", "strict")
     
     Returns:
         AnswerPolicy
     """
     signals = signals or {}
+    
+    # Правило 0: citation_mode=="strict" -> STRICT_CITATION (приоритет над category)
+    if citation_mode == "strict":
+        logger.info(f"Выбран policy: STRICT_CITATION (citation_mode='strict', category: {category})")
+        return AnswerPolicy.STRICT_CITATION
     
     # Правило 1: citation-required -> STRICT_CITATION
     if category == "citation-required":

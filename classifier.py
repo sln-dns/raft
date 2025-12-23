@@ -23,26 +23,44 @@ class QuestionClassification(BaseModel):
         "conditional / dependency",
         "citation-required",
         "other"
-    ] = Field(..., description="Категория вопроса")
+    ] = Field(..., description="Категория вопроса (смысл вопроса)")
     confidence: float = Field(..., ge=0.0, le=1.0, description="Уверенность классификации (0.0-1.0)")
     reasoning: str = Field(..., description="Краткое обоснование классификации")
+    
+    # Шаг 1: Новые поля для цитирования (с дефолтами для обратной совместимости)
+    require_citations: bool = Field(
+        default=False,
+        description="Требуются ли цитаты в ответе (true если вопрос явно просит цитировать)"
+    )
+    citation_mode: Literal["none", "quoted", "strict"] = Field(
+        default="none",
+        description="Режим цитирования: none (не нужны), quoted (с цитатами в тексте), strict (строгое цитирование без пересказа)"
+    )
+    anchor_hint: Optional[str] = Field(
+        default=None,
+        description="Подсказка по anchor (например, '§164.512(f)' для law enforcement вопросов)"
+    )
+    scope_hint: Optional[str] = Field(
+        default=None,
+        description="Подсказка по scope (например, 'law enforcement', 'family disclosure', 'minimum necessary')"
+    )
 
 
 class QuestionClassifier:
     """Классификатор вопросов для HIPAA регуляций."""
     
-    # Описания категорий для промпта
+    # Описания категорий для промпта (на английском)
     CATEGORY_DESCRIPTIONS = {
-        "overview / purpose": "Общий обзор, цель регуляций, какие части покрывают",
-        "definition": "Определения терминов (что означает X) - простые термины из словаря",
-        "regulatory_principle": "Регуляторные принципы и концепции (minimum necessary, reasonable safeguards, addressable implementation specification и т.д.) - нормативные принципы, требующие объяснения контекста применения",
-        "scope / applicability": "Область применения, какие сущности подпадают под регуляции",
-        "penalties": "Гражданские штрафы, наказания",
-        "procedural / best practices": "Процедуры, лучшие практики, шифрование, меры защиты",
-        "permission / disclosure": "Разрешения на раскрытие информации, можно ли раскрыть",
-        "conditional / dependency": "Условия и зависимости (если X, какие секции применяются)",
-        "citation-required": "Требуется цитирование конкретных текстов регуляций",
-        "other": "Другие вопросы, не подходящие под вышеперечисленные категории"
+        "overview / purpose": "General overview, purpose of regulations, which parts cover what",
+        "definition": "Term definitions (what does X mean) - simple dictionary terms",
+        "regulatory_principle": "Regulatory principles and concepts (minimum necessary, reasonable safeguards, addressable implementation specification, etc.) - normative principles requiring explanation of application context",
+        "scope / applicability": "Scope of applicability, which entities are covered by regulations",
+        "penalties": "Civil penalties, sanctions",
+        "procedural / best practices": "Procedures, best practices, encryption, safeguards",
+        "permission / disclosure": "Permissions for information disclosure, whether disclosure is allowed",
+        "conditional / dependency": "Conditions and dependencies (if X, which sections apply)",
+        "citation-required": "Citation of specific regulation texts is required",
+        "other": "Other questions not fitting the above categories"
     }
     
     def __init__(
@@ -74,22 +92,108 @@ class QuestionClassifier:
         )
     
     def _build_system_prompt(self) -> str:
-        """Строит системный промпт для классификации."""
+        """Builds system prompt for classification (in English)."""
         categories_text = "\n".join([
             f"- **{cat}**: {desc}"
             for cat, desc in self.CATEGORY_DESCRIPTIONS.items()
         ])
         
-        return f"""Ты - эксперт по классификации вопросов о HIPAA регуляциях.
+        return f"""You are an expert at classifying questions about HIPAA regulations.
 
-Твоя задача - классифицировать вопрос пользователя в одну из следующих категорий:
+Your task is to classify the user's question into one of the following categories:
 
 {categories_text}
 
-Верни классификацию в формате JSON с полями:
-- category: одна из категорий выше
-- confidence: число от 0.0 до 1.0 (уверенность в классификации)
-- reasoning: краткое обоснование (1-2 предложения)"""
+Return classification in JSON format with fields:
+- category: one of the categories above (the MEANING of the question)
+- confidence: number from 0.0 to 1.0 (classification confidence)
+- reasoning: brief justification (1-2 sentences)
+- require_citations: boolean (true if question explicitly asks to cite, e.g., "cite", "quote", "show the text")
+- citation_mode: "none" | "quoted" | "strict"
+  * "none" - citations not needed (regular questions)
+  * "quoted" - citations needed in answer text (questions like "what does X mean" require exact definitions)
+  * "strict" - strict citation without interpretation (questions like "cite the exact text", "show the regulation")
+- anchor_hint: string | null (anchor hint, e.g., "§164.512(f)" for law enforcement, "§160.103" for definitions)
+- scope_hint: string | null (topic/scope hint, e.g., "law enforcement", "family disclosure", "minimum necessary")
+
+CRITICAL RULES:
+1. category describes the MEANING of the question, NOT the citation mode
+2. If question contains "cite", "quote", "show the text", "exact text", "verbatim" -> require_citations=true
+3. If question contains explicit anchor (e.g., "§164.512(f)", "§160.103") -> set anchor_hint to that anchor (normalize spaces: "§ 164.512(f)" -> "§164.512(f)")
+4. If question asks for definition of a term -> require_citations=true, citation_mode="quoted"
+5. If question contains "cite" + strict topic (law enforcement, suspect, fugitive, victim, missing person) -> citation_mode="strict", category="citation-required"
+6. If question contains "cite" but NO strict topic -> citation_mode="quoted", category stays as determined by question meaning
+7. If question asks "what does X mean" and X is a regulatory principle (minimum necessary, reasonable safeguards, etc.) -> category="regulatory_principle", citation_mode="none" (unless "cite" is present, then "quoted")
+8. For regulatory_principle questions, citation_mode is usually "none" or "quoted" (if "cite" present), NOT "strict" unless explicit anchor is given
+9. If question mentions law enforcement, police, court, warrant, subpoena -> scope_hint="law enforcement", anchor_hint may be "§164.512(f)"
+10. anchor_hint and scope_hint: only fill if you can confidently determine from the question
+
+FEW-SHOT EXAMPLES:
+
+Example 1:
+Question: "Cite §164.512(f)(2) regarding disclosures to identify suspects."
+Response:
+{{
+  "category": "citation-required",
+  "confidence": 0.95,
+  "reasoning": "Question explicitly requests citation of a specific regulation section with anchor",
+  "require_citations": true,
+  "citation_mode": "strict",
+  "anchor_hint": "§164.512(f)(2)",
+  "scope_hint": "suspect/fugitive/witness/missing person"
+}}
+
+Example 2:
+Question: "How long retain documentation? Cite."
+Response:
+{{
+  "category": "other",
+  "confidence": 0.85,
+  "reasoning": "Question about documentation retention with citation request, but no specific regulation section mentioned",
+  "require_citations": true,
+  "citation_mode": "quoted",
+  "anchor_hint": null,
+  "scope_hint": "cite_requested"
+}}
+
+Example 3:
+Question: "Define business associate. Cite."
+Response:
+{{
+  "category": "definition",
+  "confidence": 0.9,
+  "reasoning": "Question asks for definition of a term with citation request",
+  "require_citations": true,
+  "citation_mode": "quoted",
+  "anchor_hint": null,
+  "scope_hint": "cite_requested"
+}}
+
+Example 4:
+Question: "What does minimum necessary mean?"
+Response:
+{{
+  "category": "regulatory_principle",
+  "confidence": 0.9,
+  "reasoning": "Question asks about a regulatory principle/concept, not a simple dictionary definition",
+  "require_citations": false,
+  "citation_mode": "none",
+  "anchor_hint": null,
+  "scope_hint": "minimum necessary"
+}}
+
+Example 5:
+Question: "What does minimum necessary mean? Cite."
+Response:
+{{
+  "category": "regulatory_principle",
+  "confidence": 0.9,
+  "reasoning": "Question asks about a regulatory principle with citation request",
+  "require_citations": true,
+  "citation_mode": "quoted",
+  "anchor_hint": null,
+  "scope_hint": "minimum necessary"
+}}"""
 
     def classify(self, question: str) -> QuestionClassification:
         """
@@ -105,7 +209,7 @@ class QuestionClassifier:
         
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Классифицируй следующий вопрос:\n\n{question}"}
+            {"role": "user", "content": f"Classify the following question:\n\n{question}"}
         ]
         
         # Используем structured output через response_format
@@ -127,7 +231,7 @@ class QuestionClassifier:
             )
         except Exception as e:
             # Fallback: если structured output не поддерживается, добавляем инструкцию в промпт
-            messages[-1]["content"] += "\n\nВерни ответ ТОЛЬКО в формате JSON с полями: category, confidence, reasoning"
+            messages[-1]["content"] += "\n\nReturn response ONLY in JSON format with fields: category, confidence, reasoning, require_citations, citation_mode, anchor_hint, scope_hint"
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,

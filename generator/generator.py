@@ -174,15 +174,22 @@ class AnswerGenerator:
             )
         
         # Выбираем политику генерации ответа (нужна для построения контекста)
+        # Передаем citation_mode из classification для выбора STRICT_CITATION
+        citation_mode = getattr(classification, 'citation_mode', None)
         answer_policy = choose_policy(
             category=classification.category,
             classification_confidence=classification.confidence,
             signals=retriever_signals or {},
-            question=question
+            question=question,
+            citation_mode=citation_mode
         )
         
         # Преобразуем чанки в элементы контекста с учетом политики
         context_items = build_context(chunks, answer_policy)
+        
+        # Шаг 3.1: Определяем флаг evidence_exists (есть ли anchors в контексте)
+        evidence_exists = any(item.anchor and item.text_raw for item in context_items)
+        logger.info(f"Evidence exists: {evidence_exists} (anchors found: {sum(1 for item in context_items if item.anchor)})")
         
         # Определяем политику разрешения/запрета (для permission/disclosure вопросов)
         permission_policy_enum = determine_permission_policy(classification.category, retriever_signals or {})
@@ -205,6 +212,10 @@ class AnswerGenerator:
             if "policy_signal" in retriever_signals:
                 prompt_meta["policy_signal"] = retriever_signals["policy_signal"]
                 logger.info(f"Using retriever policy_signal: {prompt_meta['policy_signal']}")
+            
+            if "concept_term" in retriever_signals:
+                prompt_meta["concept_term"] = retriever_signals["concept_term"]
+                logger.info(f"Using retriever concept_term: {prompt_meta['concept_term']}")
         
         # Специальная обработка для STRICT_CITATION - без LLM
         if answer_policy == AnswerPolicy.STRICT_CITATION:
@@ -233,13 +244,19 @@ class AnswerGenerator:
         # Для QUOTED_ANSWER и LISTING парсим JSON и валидируем citations
         if answer_policy in (AnswerPolicy.QUOTED_ANSWER, AnswerPolicy.LISTING):
             # Определяем, обязательны ли citations
-            require_citations = classification.category in ("definition", "regulatory_principle", "procedural / best practices")
+            # Используем require_citations из classification, если установлено
+            # Иначе определяем по category (обратная совместимость)
+            if hasattr(classification, 'require_citations') and classification.require_citations:
+                require_citations = True
+            else:
+                require_citations = classification.category in ("definition", "regulatory_principle", "procedural / best practices")
             
             answer_text, citations = parse_and_validate_citations(
                 llm_response=llm_response,
                 context_items=context_items,
                 require_citations=require_citations,
-                auto_fix_quote=True  # Явно включаем auto-fix для quote при валидном anchor
+                auto_fix_quote=True,  # Явно включаем auto-fix для quote при валидном anchor
+                evidence_exists=evidence_exists  # Передаем флаг наличия evidence
             )
         else:
             # Для остальных политик используем старый метод
@@ -257,6 +274,7 @@ class AnswerGenerator:
             "permission_policy": permission_policy,
             "citations_validated": answer_policy in (AnswerPolicy.QUOTED_ANSWER, AnswerPolicy.LISTING),
             "valid_citations_count": len(citations),
+            "evidence_exists": evidence_exists,  # Флаг наличия anchors в контексте
         }
         
         # Добавляем сигналы от ретривера в финальные метаданные
@@ -266,6 +284,8 @@ class AnswerGenerator:
                 meta["retriever_yesno_rationale"] = retriever_signals.get("yesno_rationale", "")
             if "policy_signal" in retriever_signals:
                 meta["retriever_policy_signal"] = retriever_signals["policy_signal"]
+            if "concept_term" in retriever_signals:
+                meta["concept_term"] = retriever_signals["concept_term"]
         
         return GenerationResult(
             answer_text=answer_text,
