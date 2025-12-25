@@ -1,0 +1,222 @@
+version: '3.8'
+
+services:
+  # Repository sync service - clones/updates code from GitHub
+  repo-sync:
+    image: alpine/git:latest
+    container_name: raft-repo-sync
+    volumes:
+      - repo:/repo
+    environment:
+      - GIT_REPO_URL=${GIT_REPO_URL}
+      - GIT_BRANCH=${GIT_BRANCH:-main}
+      - GIT_TOKEN=${GIT_TOKEN:-}
+    command: >
+      /bin/sh -c "
+        if [ ! -d /repo/.git ]; then
+          echo 'Cloning repository...';
+          if [ -n \"$$GIT_TOKEN\" ]; then
+            GIT_URL=\"$$(echo $$GIT_REPO_URL | sed \"s|https://|https://$$GIT_TOKEN@|\")\";
+          else
+            GIT_URL=\"$$GIT_REPO_URL\";
+          fi;
+          git clone --branch \"$$GIT_BRANCH\" --single-branch \"$$GIT_URL\" /repo;
+        else
+          echo 'Updating repository...';
+          cd /repo;
+          git fetch --all --prune;
+          git reset --hard origin/$$GIT_BRANCH;
+          git clean -fd;
+          git checkout -B \"$$GIT_BRANCH\" \"origin/$$GIT_BRANCH\" || true;
+        fi;
+        cd /repo;
+        echo 'Current commit: '$$(git rev-parse HEAD);
+        echo 'Current branch: '$$(git rev-parse --abbrev-ref HEAD);
+      "
+    restart: "no"  # Manual restart required after code updates
+
+  # PostgreSQL database with pgvector
+  db:
+    image: pgvector/pgvector:pg17
+    container_name: raft-db
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-raft}
+      - POSTGRES_USER=${POSTGRES_USER:-raft_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"  # Expose for debugging if needed
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-raft_user} -d ${POSTGRES_DB:-raft}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Database initialization - restore from dump
+  db-init:
+    image: postgres:17
+    container_name: raft-db-init
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-raft}
+      - POSTGRES_USER=${POSTGRES_USER:-raft_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_SUPERUSER=${POSTGRES_SUPERUSER:-postgres}
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
+    volumes:
+      - dbinit_state:/state
+      - ./raft.dump:/backup/raft.dump:ro
+    command: >
+      /bin/bash -c "
+        MARKER_FILE=\"/state/RESTORED_OK\";
+        if [ -f \"$$MARKER_FILE\" ]; then
+          echo \"Database already restored (marker exists), skipping...\";
+          exit 0;
+        fi;
+        if [ ! -f /backup/raft.dump ]; then
+          echo \"ERROR: Backup file not found: /backup/raft.dump\";
+          exit 1;
+        fi;
+        echo \"Waiting for PostgreSQL...\";
+        # Use superuser (postgres) for admin operations
+        SUPERUSER=\"$$POSTGRES_SUPERUSER\";
+        SUPERUSER_PASSWORD=\"$$POSTGRES_PASSWORD\";
+        # For postgres user, password is same as POSTGRES_PASSWORD in pgvector image
+        until pg_isready -h db -p 5432 -U \"$$SUPERUSER\" > /dev/null 2>&1; do
+          sleep 2;
+        done;
+        echo \"PostgreSQL ready\";
+        mkdir -p /state;
+        DB_EXISTS=$$(PGPASSWORD=\"$$SUPERUSER_PASSWORD\" psql -h db -p 5432 -U \"$$SUPERUSER\" -d postgres -tc \"SELECT 1 FROM pg_database WHERE datname='$$POSTGRES_DB'\" | grep -q 1 && echo yes || echo no);
+        if [ \"$$DB_EXISTS\" = \"yes\" ]; then
+          echo \"Dropping existing database...\";
+          # Terminate active connections before DROP
+          PGPASSWORD=\"$$SUPERUSER_PASSWORD\" psql -h db -p 5432 -U \"$$SUPERUSER\" -d postgres -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$$POSTGRES_DB' AND pid <> pg_backend_pid();\" || true;
+          PGPASSWORD=\"$$SUPERUSER_PASSWORD\" psql -h db -p 5432 -U \"$$SUPERUSER\" -d postgres -c \"DROP DATABASE $$POSTGRES_DB;\";
+        fi;
+        echo \"Creating database...\";
+        PGPASSWORD=\"$$SUPERUSER_PASSWORD\" psql -h db -p 5432 -U \"$$SUPERUSER\" -d postgres -c \"CREATE DATABASE $$POSTGRES_DB;\";
+        echo \"Enabling extensions...\";
+        PGPASSWORD=\"$$SUPERUSER_PASSWORD\" psql -h db -p 5432 -U \"$$SUPERUSER\" -d $$POSTGRES_DB -c \"CREATE EXTENSION IF NOT EXISTS vector;\";
+        PGPASSWORD=\"$$SUPERUSER_PASSWORD\" psql -h db -p 5432 -U \"$$SUPERUSER\" -d $$POSTGRES_DB -c \"CREATE EXTENSION IF NOT EXISTS pg_trgm;\";
+        echo \"Restoring database...\";
+        # Restore using superuser, but objects will be owned by POSTGRES_USER after restore
+        PGPASSWORD=\"$$SUPERUSER_PASSWORD\" pg_restore --no-owner --no-privileges -v -h db -p 5432 -U \"$$SUPERUSER\" -d $$POSTGRES_DB /backup/raft.dump;
+        TABLE_COUNT=$$(PGPASSWORD=\"$$SUPERUSER_PASSWORD\" psql -h db -p 5432 -U \"$$SUPERUSER\" -d $$POSTGRES_DB -tAc \"SELECT count(*) FROM information_schema.tables WHERE table_schema='public';\");
+        echo \"Tables restored: $$TABLE_COUNT\";
+        if [ \"$$TABLE_COUNT\" -gt 0 ]; then
+          echo \"$$(date)\" > $$MARKER_FILE;
+          echo \"Restore completed successfully\";
+        else
+          echo \"WARNING: No tables found after restore\";
+          exit 1;
+        fi;
+      "
+    restart: "no"  # Run once, manual restart if needed
+
+  # FastAPI application
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/api/Dockerfile
+    container_name: raft-api
+    depends_on:
+      db:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+      repo-sync:
+        condition: service_completed_successfully
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-raft_user}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-raft}
+      - VSEGPT_API_KEY=${VSEGPT_API_KEY}
+      - CLASSIFICATION_MODEL=${CLASSIFICATION_MODEL:-anthropic/claude-3-haiku}
+      - GENERATION_MODEL=${GENERATION_MODEL:-anthropic/claude-3-haiku}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-emb-qwen/qwen3-embedding-8b}
+      - DOC_ID=${DOC_ID:-hipaa-reg-2013-03-26}
+      - PATH=/repo/.venv/bin:/usr/local/bin:/usr/bin:/bin
+    volumes:
+      - repo:/repo:ro  # Read-only mount of repository code
+    working_dir: /repo
+    command: >
+      /bin/bash -c "
+        cd /repo &&
+        if [ -f uv.lock ]; then
+          echo 'Installing dependencies from uv.lock...';
+          uv sync --frozen --no-dev || echo 'Warning: uv sync failed, using fallback';
+        else
+          echo 'Warning: uv.lock not found, using pre-installed minimal deps';
+        fi &&
+        export PATH=\"/repo/.venv/bin:$$PATH\" &&
+        uvicorn app:app --host 0.0.0.0 --port 8000
+      "
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Streamlit UI
+  ui:
+    build:
+      context: ..
+      dockerfile: deploy/ui/Dockerfile
+    container_name: raft-ui
+    depends_on:
+      - api
+      - repo-sync
+    environment:
+      - API_BASE_URL=http://api:8000
+      - PATH=/repo/.venv/bin:/usr/local/bin:/usr/bin:/bin
+    volumes:
+      - repo:/repo:ro  # Read-only mount of repository code
+    working_dir: /repo
+    command: >
+      /bin/bash -c "
+        cd /repo &&
+        if [ -f uv.lock ]; then
+          echo 'Installing dependencies from uv.lock...';
+          uv sync --frozen --no-dev || echo 'Warning: uv sync failed, using fallback';
+        else
+          echo 'Warning: uv.lock not found, using pre-installed minimal deps';
+        fi &&
+        export PATH=\"/repo/.venv/bin:$$PATH\" &&
+        streamlit run ui_simple.py --server.port=8501 --server.address=0.0.0.0 --server.headless=true
+      "
+    restart: unless-stopped
+
+  # Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: raft-nginx
+    depends_on:
+      api:
+        condition: service_healthy
+      ui:
+        condition: service_started
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+    restart: unless-stopped
+
+  # Cloudflare Quick Tunnel
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: raft-cloudflared
+    depends_on:
+      - nginx
+    command: tunnel --no-autoupdate --url http://nginx:80
+    restart: unless-stopped
+
+volumes:
+  repo:        # Repository code from GitHub
+  pgdata:      # PostgreSQL data (persistent)
+  dbinit_state: # Database initialization state (marker file)

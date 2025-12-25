@@ -16,3 +16,4 @@ request_ocr.py
 .env
 dump/
 *.log
+architecture.txt
