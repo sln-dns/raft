@@ -4,18 +4,47 @@ from typing import List, Optional, Dict
 from pathlib import Path
 import psycopg
 import re
+import os
+from urllib.parse import urlparse
 
 from .base import CandidateChunk
 
 
 def get_db_connection():
-    """Создает подключение к базе данных."""
-    user = Path.home().name
-    return psycopg.connect(
-        host="localhost",
-        dbname="raft",
-        user=user,
-    )
+    """Создает подключение к базе данных.
+    
+    Использует DATABASE_URL из переменных окружения, если задан.
+    Иначе использует fallback для локальной разработки.
+    """
+    database_url = os.getenv("DATABASE_URL")
+    
+    if database_url:
+        # Парсим DATABASE_URL: postgresql://user:password@host:port/dbname
+        parsed = urlparse(database_url)
+        
+        # Извлекаем компоненты URL
+        user = parsed.username or "postgres"
+        password = parsed.password or ""
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 5432
+        dbname = parsed.path.lstrip("/") or "raft"
+        
+        # Подключаемся с использованием DATABASE_URL
+        return psycopg.connect(
+            host=host,
+            port=port,
+            dbname=dbname,
+            user=user,
+            password=password,
+        )
+    else:
+        # Fallback для локальной разработки
+        user = Path.home().name
+        return psycopg.connect(
+            host="localhost",
+            dbname="raft",
+            user=user,
+        )
 
 
 def normalize_fts_scores(candidates: List[CandidateChunk]) -> None:
